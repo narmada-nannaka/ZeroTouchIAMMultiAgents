@@ -1,0 +1,9 @@
+# Use the correct REST API structure for gcloud to read the file
+name: projects/zero-touch-iam-agent/roles/ZeroTouchIamProvisionerRole
+title: "ZeroTouch IAM Provisioner Role"
+description: "Allows the Zero-Touch Agent to securely set IAM policies on specific projects."
+stage: "GA"
+# The required field for permissions is 'includedPermissions'
+includedPermissions:
+- iam.serviceAccounts.setIamPolicy
+- resourcemanager.projects.setIamPolicy

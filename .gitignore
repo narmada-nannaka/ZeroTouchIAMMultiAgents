@@ -1,0 +1,5 @@
+.env
+.venv/
+.claude/
+test.ps1
+PMO/
