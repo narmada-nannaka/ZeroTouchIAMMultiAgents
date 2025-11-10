@@ -3,8 +3,11 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY provisioning_agent.py .
+
+# Copy both the app.py and provisioning_agent.py
 COPY app.py .
+COPY provisioning_agent.py .
+
 # Define the port Cloud Run will use
 ENV PORT=8080
 

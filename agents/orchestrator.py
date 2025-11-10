@@ -10,10 +10,12 @@ from agents.nlu_classifier_agent import NLUClassifierAgent
 from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 from google.adk.tools import FunctionTool
 from google.adk.sessions.base_session_service import BaseSessionService
+from google.genai import types # Import types for Content and Part
 import os
 import logging
 import json
 from typing import Dict, Any, Callable
+from google.adk.runners import Runner
 
 # Set up logging for visibility
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +58,9 @@ class IAMOrchestrator(LlmAgent):
         # Remote A2A client
         # RemoteA2aAgent will fetch the agent_card from the provisioning service URL automatically
         # Pass the agent card URL directly - RemoteA2aAgent will fetch it internally
-        agent_card_url = f"{provisioning_service_url}/.well-known/agent-card"
+        agent_card_url = f"{provisioning_service_url}/.well-known/agent.json"
+
+        logging.info(f"Initializing RemoteA2aAgent with agent card URL: {agent_card_url}")
 
         # The to_a2a() function on the provisioning service exposes the agent_card at a standard endpoint
         remote_provisioning_agent = RemoteA2aAgent(
@@ -120,7 +124,8 @@ class IAMOrchestrator(LlmAgent):
         
         # SIMULATION INPUT: Approver sends a message back after receiving the justification email
         simulated_approver_email = lookup_result.get("required_approvers") # Use the first approver
-        simulated_response_text = "Yes, I approve this elevation request immediately."
+        #simulated_response_text = "I'm travelling this week, so I'll review this next Monday."
+        simulated_response_text = "Yes, please approve this request."
         
         logging.info(f"[{session_id}] Simulating inbound email from {simulated_approver_email}")
 
@@ -147,15 +152,68 @@ class IAMOrchestrator(LlmAgent):
             
             logging.info("DELEGATION: NLU Approved. Calling isolated Provisioning Agent via A2A pattern.")
 
-            # Create a task message for the remote agent
-            # The remote agent's LLM will understand this request and call the appropriate tool
-            task_prompt = (
-                f"Execute IAM provisioning with these parameters:\n"
-                f"- requested_role: {requested_role}\n"
-                f"- user_id: {user_id}\n"
-                f"- justification: {policy_context.get('justification_summary', 'No justification provided')}\n"
-                f"\nPlease call the appropriate tool to execute the IAM role assignment."
+            a2a_session_id = f"{session_id}_a2a_execution"
+            a2a_app_name = "IAM_A2A_Provisioner"
+            await self.session_service.create_session(
+                session_id=a2a_session_id,
+                app_name=a2a_app_name,
+                user_id=user_id,
+                state={"parent_session": session_id, "phase": "provisioning_execution"}
             )
+            logging.info(f"Created A2A session: {a2a_session_id} for remote provisioning agent")
+
+            # Create the Runner for the remote provisioning agent
+            remote_runner = Runner(
+                agent=provisioning_agent,
+                app_name=a2a_app_name,
+                session_service=self.session_service
+            )
+
+            # build the argument bag
+            args = {
+                "requested_role": requested_role,
+                "user_id": user_id,
+                "justification": policy_context.get("justification_summary", "No justification provided"),
+            }
+
+            # A2A-compliant envelope
+            tool_call_envelope = {
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "execute_iam_set_tool",
+                            "arguments": json.dumps(args)  # arguments must be a JSON string
+                        }
+                    }
+                ]
+            }
+            
+            # Prefer an application/json part first, then a human-readable text part
+            try:
+                # If your google.genai types supports inline_data Blob (newer SDKs)
+                from google.genai import types as genai_types
+                json_part = types.Part(
+                    inline_data=genai_types.Blob(
+                        mime_type="application/json",
+                        data=json.dumps(tool_call_envelope).encode("utf-8"),
+                    )
+                )
+            except Exception:
+                # Fallback for older SDKs that accept mime_type + data directly
+                json_part = types.Part(
+                    mime_type="application/json",
+                    data=tool_call_envelope  # SDK will JSON-serialize
+                )
+
+            text_part = types.Part(text=(
+                "Execute IAM provisioning using execute_iam_set_tool; JSON args are included above."
+            ))
+
+            task_message = types.Content(role="user", parts=[json_part, text_part])
+
+            logging.info("A2A task_message parts: %s",
+             [getattr(p, "mime_type", "text") for p in task_message.parts])
             
             # Delegate to the remote agent by calling it through ADK's agent delegation mechanism
             # The orchestrator's LLM will transfer control to the remote agent
@@ -163,30 +221,55 @@ class IAMOrchestrator(LlmAgent):
             # We must iterate it to get the final result dictionary.
             execution_result = {}
             try:
-                async for event in provisioning_agent.run_async(task_prompt):
-                    if hasattr(event, 'content') and event.content:
-                        # Try to extract the tool result from the event
-                        if hasattr(event.content, 'text') and event.content.text:
-                            try:
-                                # The tool output should be in the text as JSON
-                                execution_result = json.loads(event.content.text)
-                            except json.JSONDecodeError:
-                                # If not JSON, try to extract from the raw text
-                                execution_result = {"status": "PARSE_ERROR", "raw_output": event.content.text}
-                        elif hasattr(event.content, 'to_dict'):
-                            execution_result = event.content.to_dict()
-                        
-                        # Check if this event contains tool results
-                        if hasattr(event, 'tool_results') and event.tool_results:
-                            # Extract the actual tool return value
-                            for tool_result in event.tool_results:
-                                if hasattr(tool_result, 'output'):
-                                    execution_result = tool_result.output
-                                    break
+                async for event in remote_runner.run_async(
+                    user_id=user_id,
+                    session_id=a2a_session_id,
+                    new_message=task_message
+                ):
+                    if event.is_final_response() and event.content:
+                        # Try to extract JSON from the final text response
+                        if event.content.parts:
+                            for part in event.content.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    try:
+                                        # The tool result might be wrapped in the text
+                                        execution_result = json.loads(part.text)
+                                        logging.info(f"Parsed execution result: {execution_result}")
+                                        break
+                                    except json.JSONDecodeError:
+                                        # If not JSON, store as raw output
+                                        execution_result = {
+                                            "status": "PARSE_ERROR",
+                                            "raw_output": part.text
+                                        }
+                    
+                    # Also check for tool results in the event
+                    if hasattr(event, 'tool_results') and event.tool_results:
+                        for tool_result in event.tool_results:
+                            if hasattr(tool_result, 'output'):
+                                # Tool output is directly available
+                                execution_result = tool_result.output
+                                logging.info(f"Got tool result directly: {execution_result}")
+                                break
+                
+                    # If we didn't get any result, set a default error
+                    if not execution_result:
+                        execution_result = {
+                            "status": "NO_RESPONSE",
+                            "error": "Remote agent did not return any result"
+                        }
+
+                    # Clean up the temporary A2A session
+                    await self.session_service.delete_session(a2a_session_id)
                                     
             except Exception as e:
-                logging.error(f"Error during A2A delegation: {e}")
+                logging.error(f"Error during A2A delegation: {e}", exc_info=True)
                 execution_result = {"status": "DELEGATION_ERROR", "error": str(e)}
+                # Clean up session even on error
+                try:
+                    await self.session_service.delete_session(a2a_session_id)
+                except:
+                    pass
 
             
             # --- 7. Final Audit and Response (Task 2) ---

@@ -23,6 +23,12 @@ if not PROJECT_ID or not A2A_PROVISIONER_URL:
     logging.error("Missing required environment variables (PROJECT_ID or A2A_PROVISIONER_URL).")
     raise EnvironmentError("Deployment environment variables are not set correctly.")
 
+# Normalize to https and strip trailing slash
+if A2A_PROVISIONER_URL.startswith("http://"):
+    logging.warning("A2A_PROVISIONER_URL is http, normalizing to https for Cloud Run")
+    A2A_PROVISIONER_URL = "https://" + A2A_PROVISIONER_URL.split("://",1)[1]
+A2A_PROVISIONER_URL = A2A_PROVISIONER_URL.rstrip("/")
+
 ADK_SESSION_DB = "adk-sessions-store" #database for provisioning requests session
 PROVISIONING_REQUESTS_COLLECTION = "provisioning-requests" #dedicated collection for audit trail
 
@@ -83,12 +89,15 @@ class FirestoreSessionService(BaseSessionService):
         logging.info(f"Created and persisted session: {session_id}")
         return session
 
-    async def get_session(self, session_id: str) -> Optional[Session]:
+    async def get_session(self, *, app_name: str, user_id: str, session_id: str, config=None) -> Optional[Session]:
         """
         Retrieve a session from Firestore.
 
         Args:
+            app_name: Application name (for ADK compatibility)
+            user_id: User ID (for ADK compatibility)
             session_id: Unique identifier for the session
+            config: Optional GetSessionConfig for filtering events
 
         Returns:
             Session object if found, None otherwise
@@ -108,7 +117,7 @@ class FirestoreSessionService(BaseSessionService):
             state=data.get("state", {})
         )
 
-        logging.info(f"Retrieved session: {session_id}")
+        logging.info(f"Retrieved session: {session_id} (app: {app_name}, user: {user_id})")
         return session
 
     async def update_session(self, session: Session) -> None:

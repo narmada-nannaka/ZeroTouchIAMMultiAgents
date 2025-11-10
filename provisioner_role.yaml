@@ -1,0 +1,8 @@
+
+title: "ZeroTouch IAM Provisioner Role"
+description: "Allows the Zero-Touch Agent to securely set IAM policies on this specific target project."
+stage: "GA"
+includedPermissions:
+- resourcemanager.projects.setIamPolicy
+# We only need 'setIamPolicy' on the target resource, not 'iam.serviceAccounts.setIamPolicy'
+# which is needed in the source project to manage the Service Account itself.

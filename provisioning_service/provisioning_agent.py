@@ -18,8 +18,12 @@ class IAMProvisioningAgent(LlmAgent):
     def __init__(self, project_id: str, **kwargs):
         # Define the privileged tool using a closure that captures project_id
         # The closure captures project_id directly from the parameter
-        def execute_iam_set_tool(requested_role: str, user_id: str, justification: str) -> Dict[str, Any]:
+        def execute_iam_set_tool(requested_role: str, user_id: str, justification: str, **extra_kwargs) -> Dict[str, Any]:
             """Simulates the JIT elevation and the immutable policy application."""
+            # Ignore extra parameters like 'configuration', 'context', etc.
+            if extra_kwargs:
+                logging.info(f"Received extra parameters (ignoring): {list(extra_kwargs.keys())}")
+            
             return self._perform_iam_set(requested_role, user_id, justification, project_id)
 
         iam_tool = FunctionTool(

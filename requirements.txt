@@ -1,5 +1,5 @@
 # Root requirements.txt for the Orchestrator Service
-google-adk[a2a,firestore]
+google-adk[a2a]
 google-cloud-firestore
 google-cloud-aiplatform # Required for NLU and RAG agents
 uvicorn[standard]       # Standard server
