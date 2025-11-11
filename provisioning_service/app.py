@@ -10,9 +10,6 @@ from starlette.requests import Request
 import base64, json
 from datetime import datetime
 
-# Import ADK A2A utility to create A2A server
-from google.adk.a2a.utils.agent_to_a2a import to_a2a
-
 # Set logging to DEBUG level for more details
 logging.basicConfig(
     level=logging.DEBUG,
@@ -21,24 +18,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-PROJECT_ID = os.environ.get("PROJECT_ID")
+#PROJECT_ID = os.environ.get("PROJECT_ID")
 PORT = int(os.environ.get("PORT", 8080))
 HOST = os.environ.get("HOST", "0.0.0.0")
 
-REQUIRED = ("requested_role", "user_id", "justification")
+REQUIRED = ("requested_role", "user_id", "justification", "gcp_project_scope")
 
 # NEW: Get the service URL from environment (we'll set this during deployment)
 SERVICE_URL = os.environ.get("SERVICE_URL", "")
 
-if not PROJECT_ID:
-    # A Cloud Run service must always have a Project ID, or it cannot initialize GCP services.
-    logger.error("PROJECT_ID environment variable is missing!")
-    raise EnvironmentError("PROJECT_ID not set")
+# if not PROJECT_ID:
+#     # A Cloud Run service must always have a Project ID, or it cannot initialize GCP services.
+#     logger.error("PROJECT_ID environment variable is missing!")
+#     raise EnvironmentError("PROJECT_ID not set")
 
 
 logger.info("="*60)
 logger.info(f"Starting IAM Provisioning A2A Service")
-logger.info(f"PROJECT_ID: {PROJECT_ID}")
+#logger.info(f"PROJECT_ID: {PROJECT_ID}")
 logger.info(f"HOST: {HOST}, PORT: {PORT}")
 logger.info(f"SERVICE_URL: {SERVICE_URL}")
 logger.info("="*60)
@@ -47,29 +44,28 @@ def _extract_tool_from_json_dict(d: dict):
     """
     Given a JSON dict potentially containing a tool_calls envelope, return (name, args).
     """
+    logging.info(f"[DEBUG] _extract_tool_from_json_dict input: {d}")
     if not isinstance(d, dict):
         return None, {}
     calls = d.get("tool_calls") or d.get("toolCalls")
     if not isinstance(calls, list) or not calls:
+        logging.info("[DEBUG] No tool_calls found in dict")
         return None, {}
     fn = calls[0].get("function", {}) if isinstance(calls[0], dict) else {}
     name = fn.get("name")
     raw_args = fn.get("arguments") or fn.get("args") or "{}"
+    logging.info(f"[DEBUG] Raw arguments string: {raw_args}")
     try:
         args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-    except Exception:
-        logging.warning("Could not JSON-decode 'arguments'; using empty args")
+        logging.info(f"[DEBUG] Parsed arguments dict: {args}")
+    except Exception as e:
+        logging.warning(f"Could not JSON-decode 'arguments': {e}")
         args = {}
     return name, args
 
 def _parse_tool_from_parts(parts: list):
     """
     Iterate through all known shapes the SDK emits and return (tool_name, tool_input) or (None, {}).
-    Handles:
-      1) Top-level {mimeType:'application/json', data:{...}}
-      2) {file:{mimeType:'application/json', bytes:BASE64}}
-      3) {inlineData:{mimeType:'application/json', data:BASE64}}
-      4) Ignore plain text for structured tool_calls.
     """
     if not parts:
         return None, {}
@@ -118,14 +114,12 @@ def _parse_tool_from_parts(parts: list):
     return None, {}
 
 # 1. Initialize the Isolated Agent
-logging.info(f"Initializing IAMProvisioningAgent for Project: {PROJECT_ID}")
-provisioning_agent = IAMProvisioningAgent(project_id=PROJECT_ID)
+#logging.info(f"Initializing IAMProvisioningAgent for Project: {PROJECT_ID}")
+provisioning_agent = IAMProvisioningAgent()
 logger.info(f"Agent initialized: {provisioning_agent.name}")
 logger.info(f"Agent tools: {[tool.name for tool in provisioning_agent.tools]}")
 
 # 2. Expose the Agent as an A2A Server
-# The to_a2a() function creates a Starlette app with A2A protocol support
-# In ADK 1.17.0, to_a2a() only takes the agent parameter
 # ============================================================================
 # A2A Protocol Endpoints (Correct paths per official ADK docs)
 # ============================================================================
@@ -133,7 +127,6 @@ logger.info(f"Agent tools: {[tool.name for tool in provisioning_agent.tools]}")
 async def agent_card_handler(request: Request):
     """
     Serves the A2A agent card at /.well-known/agent.json
-    Per official ADK docs: https://google.github.io/adk-docs/a2a/quickstart-exposing/
     """
     logger.info(f"Agent card requested from: {request.client.host if request.client else 'unknown'}")
     
@@ -188,7 +181,6 @@ async def agent_card_handler(request: Request):
     logger.info(f"Agent card URL field: {agent_card['url']}")
     logger.info(f"Agent card 'endpoint' field: {agent_card.get('endpoint')}")  # ADD THIS LINE
     logger.info(f"Agent card has {len(tools_info)} tool(s)")
-    logger.debug(f"Agent card: {json.dumps(agent_card, indent=2)}")
     
     return JSONResponse(agent_card, headers={
         "Content-Type": "application/json",
@@ -202,7 +194,7 @@ async def tasks_send_handler(request: Request):
     """
     try:
         body = await request.json()
-        logger.info(f"Task request received: {json.dumps(body, indent=2)}")
+        logger.info(f"[DEBUG] Raw task request body: {json.dumps(body, indent=2)}")
         
         # Extract message from A2A JSON-RPC format
         # A2A uses JSON-RPC with params containing the message
@@ -212,7 +204,10 @@ async def tasks_send_handler(request: Request):
         
         # Extract tool call information from the message
         # The LLM's tool call will be in the message parts
+        logger.info(f"[DEBUG] Message parts to parse: {json.dumps(parts, indent=2)}")
         tool_name, tool_input = _parse_tool_from_parts(parts)
+        logger.info(f"[DEBUG] Parsed tool_name: {tool_name}")
+        logger.info(f"[DEBUG] Parsed tool_input: {tool_input}")
 
         # Fallback: accept direct params if tool_calls not present
         if not tool_input and params:
@@ -220,9 +215,10 @@ async def tasks_send_handler(request: Request):
             if all(k in params for k in REQUIRED):
                 tool_name = tool_name or "execute_iam_set_tool"
                 tool_input = {
-                    "requested_role": params["requested_role"],
-                    "user_id": params["user_id"],
-                    "justification": params["justification"],
+                    "requested_role": params.get("requested_role"),
+                    "user_id": params.get("user_id"),
+                    "justification": params.get("justification"),
+                    "gcp_project_scope": params.get("gcp_project_scope")
                 }
         # Validate
         missing = [k for k in REQUIRED if k not in (tool_input or {})]
@@ -246,35 +242,45 @@ async def tasks_send_handler(request: Request):
         for tool in provisioning_agent.tools:
             if tool.name == tool_name or tool.name == "execute_iam_set_tool":
                 result = tool.func(**tool_input)
-                logger.info(f"Tool execution result: {result.get('status')}")
+                logger.info(f"Tool execution result: {result.status}")
                 
                 # CORRECT A2A RESPONSE FORMAT with Task structure
-                task_id = str(body.get("id"))
+                request_id = body.get("id", "unknown")
+                task_id = str(request_id)
+                timestamp_str = datetime.now().isoformat()
                 message_id = f"msg-{task_id}"
-                
+                context_id = params.get("contextId", f"ctx-{task_id}")
+
+                # Serialize the tool result
+                result_data = result.model_dump() if hasattr(result, 'model_dump') else result
+                result_json = json.dumps(result_data)
+
                 response = {
                     "jsonrpc": "2.0",
-                    "id": task_id,
+                    "id": request_id,
                     "result": {
-                        "task": {
-                            "contextId": task_id,
-                            "id": task_id,
-                            "status": "completed"  # Required field
-                        },
-                        "message": {
-                            "messageId": message_id,
-                            "role": "agent",  # Must be "agent" or "user"
-                            "parts": [
-                                {
-                                    "text": json.dumps(result)  # Tool result as JSON string
-                                }
-                            ]
-                        }
+                        # Task fields at result level
+                        "contextId": context_id,
+                        "id": task_id,
+                        "status": "completed",
+                        "createdAt": timestamp_str,
+                        # Message fields at result level
+                        "messageId": message_id,
+                        "role": "agent",
+                        "parts": [
+                            {
+                                "text": json.dumps(result_data)
+                            }
+                        ]
                     }
                 }
                 
-                logger.info(f"Returning response with task status: completed")
-                return JSONResponse(response, status_code=200)
+                logger.info(f"Returning A2A response with task status: completed")
+                logger.info(f"Full response to orchestrator: {json.dumps(response, indent=2)}")
+                
+                return JSONResponse(response, status_code=200, headers={
+                    "Content-Type": "application/json"
+                })
         
         # Tool not found
         logger.error(f"Tool not found: {tool_name}")
@@ -283,18 +289,33 @@ async def tasks_send_handler(request: Request):
             "id": body.get("id"),
             "error": {
                 "code": -32601,
-                "message": f"Tool '{tool_name}' not found"
+                "message": f"Tool '{tool_name}' not found in agent '{provisioning_agent.name}'",
+                "data": {
+                    "requested_tool": tool_name,
+                    "available_tools": [t.name for t in provisioning_agent.tools]
+                }
             }
         }, status_code=404)
         
     except Exception as e:
         logger.error(f"Error processing task: {e}", exc_info=True)
+        request_id = None
+        try:
+            #If Body exists and is a dict, try to pull the id
+            if 'body' in locals() and isinstance(body, dict):
+                request_id = body.get("id")
+        except Exception:
+            # Swallow any secondary errors to preserve original exception context
+            pass
         return JSONResponse({
             "jsonrpc": "2.0",
-            "id": body.get("id", None),
+            "id": request_id,
             "error": {
                 "code": -32603,
-                "message": str(e)
+                "message": f"Internal server error: {str(e)}",
+                "data": {
+                    "error_type": type(e).__name__
+                }
             }
         }, status_code=500)
 
@@ -304,7 +325,7 @@ async def health_handler(request: Request):
         "status": "healthy",
         "service": "iam-provisioning-a2a-service",
         "agent": provisioning_agent.name,
-        "project_id": PROJECT_ID
+        #"project_id": PROJECT_ID
     })
 
 async def root_handler(request: Request):

@@ -2,15 +2,12 @@
 
 from google.adk.agents import LlmAgent
 from agents.lookup_agent import ApproverLookupAgent
-# NEW IMPORT: Policy Context Agent
 from agents.context_agent import PolicyContextAgent
-# NEW IMPORT: NLU Classifier Agent
 from agents.nlu_classifier_agent import NLUClassifierAgent
-# NEW IMPORT: Consuming the agent service through RemoteA2Agent
 from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 from google.adk.tools import FunctionTool
 from google.adk.sessions.base_session_service import BaseSessionService
-from google.genai import types # Import types for Content and Part
+from google.genai import types 
 import os
 import logging
 import json
@@ -57,12 +54,11 @@ class IAMOrchestrator(LlmAgent):
 
         # Remote A2A client
         # RemoteA2aAgent will fetch the agent_card from the provisioning service URL automatically
-        # Pass the agent card URL directly - RemoteA2aAgent will fetch it internally
         agent_card_url = f"{provisioning_service_url}/.well-known/agent.json"
 
         logging.info(f"Initializing RemoteA2aAgent with agent card URL: {agent_card_url}")
 
-        # The to_a2a() function on the provisioning service exposes the agent_card at a standard endpoint
+        
         remote_provisioning_agent = RemoteA2aAgent(
             name="iam_provisioner_client",
             description="Remote agent that handles secure IAM provisioning operations",
@@ -92,7 +88,7 @@ class IAMOrchestrator(LlmAgent):
         session.state['request'] = { "user_id": user_id, "role": requested_role, "scope": project_scope, "status": "LOOKUP_INITIATED" }
         logging.info(f"[{session_id}] Provisioning started. Delegating lookup...")
         
-        # --- 2. Delegate Lookup (Week 1) ---
+        # --- 2. Delegate Lookup  ---
         lookup_agent = self.find_agent("ApproverLookupAgent")
         lookup_tool_func = _get_tool_func(lookup_agent, "lookup_approvers_policy")
         
@@ -100,19 +96,19 @@ class IAMOrchestrator(LlmAgent):
         if "error" in lookup_result:
             return lookup_result 
 
-        # --- 3. Delegate RAG Retrieval & Compliance Check (Task 1) ---
+        # --- 3. Delegate RAG Retrieval & Compliance Check ---
         context_agent = self.find_agent("PolicyContextAgent")
         doc_id = lookup_result.get("baseline_policy_doc_id", "NOT_FOUND")
 
-        # Execute RAG Retrieval (Tool 1: _retrieve_policy_text)
+        # Execute RAG Retrieval ( _retrieve_policy_text)
         rag_tool_func = _get_tool_func(context_agent, "_retrieve_policy_text")
         policy_context = rag_tool_func(doc_id=doc_id)
 
-        # Execute Compliance Check (Tool 2: _check_temporal_compliance)
+        # Execute Compliance Check (_check_temporal_compliance)
         check_tool_func = _get_tool_func(context_agent, "_check_temporal_compliance")
         is_compliant, compliance_reason = check_tool_func(constraint_type=policy_context.get("constraint_type"))
 
-        # --- 4. Enforce Compliance Guardrail (Improvement 2) ---
+        # --- 4. Enforce Compliance Guardrail ---
         if not is_compliant:
             logging.error(f"GUARDRAIL FAIL: Request rejected: {compliance_reason}")
             session.state['status'] = "POLICY_VIOLATION_REJECTED"
@@ -138,7 +134,7 @@ class IAMOrchestrator(LlmAgent):
             sender_email=simulated_approver_email
         )
 
-        # --- 7. Delegate to Secure Execution Agent (Task 1) ---
+        # --- 7. Delegate to Secure Execution Agent ---
 
         if nlu_result.get("status") == "APPROVED":
             
@@ -170,11 +166,15 @@ class IAMOrchestrator(LlmAgent):
             )
 
             # build the argument bag
+            logging.info(f"[DEBUG] Building args - project_scope value: {project_scope}")
+            logging.info(f"[DEBUG] policy_context: {policy_context}")
             args = {
                 "requested_role": requested_role,
                 "user_id": user_id,
                 "justification": policy_context.get("justification_summary", "No justification provided"),
+                "gcp_project_scope": project_scope
             }
+            logging.info(f"[DEBUG] Final args dict: {args}")
 
             # A2A-compliant envelope
             tool_call_envelope = {
@@ -188,6 +188,7 @@ class IAMOrchestrator(LlmAgent):
                     }
                 ]
             }
+            logging.info(f"[DEBUG] tool_call_envelope: {json.dumps(tool_call_envelope, indent=2)}")
             
             # Prefer an application/json part first, then a human-readable text part
             try:
@@ -220,51 +221,98 @@ class IAMOrchestrator(LlmAgent):
             # This happens automatically through ADK's agent orchestration
             # We must iterate it to get the final result dictionary.
             execution_result = {}
+            result_found = False
             try:
+                logging.info(f"Starting A2A runner for session: {a2a_session_id}")
+
                 async for event in remote_runner.run_async(
                     user_id=user_id,
                     session_id=a2a_session_id,
                     new_message=task_message
                 ):
-                    if event.is_final_response() and event.content:
-                        # Try to extract JSON from the final text response
-                        if event.content.parts:
-                            for part in event.content.parts:
-                                if hasattr(part, 'text') and part.text:
-                                    try:
-                                        # The tool result might be wrapped in the text
-                                        execution_result = json.loads(part.text)
-                                        logging.info(f"Parsed execution result: {execution_result}")
-                                        break
-                                    except json.JSONDecodeError:
-                                        # If not JSON, store as raw output
-                                        execution_result = {
-                                            "status": "PARSE_ERROR",
-                                            "raw_output": part.text
-                                        }
-                    
-                    # Also check for tool results in the event
-                    if hasattr(event, 'tool_results') and event.tool_results:
-                        for tool_result in event.tool_results:
-                            if hasattr(tool_result, 'output'):
-                                # Tool output is directly available
-                                execution_result = tool_result.output
-                                logging.info(f"Got tool result directly: {execution_result}")
-                                break
-                
-                    # If we didn't get any result, set a default error
-                    if not execution_result:
-                        execution_result = {
-                            "status": "NO_RESPONSE",
-                            "error": "Remote agent did not return any result"
-                        }
+                    logging.info(f"Received event type: {type(event).__name__}")
 
+                    # check if this is the final response
+                    if hasattr(event, 'tool_results') and event.tool_results:
+                        logging.info(f"✓ Found {len(event.tool_results)} tool_results in event")
+                        for tool_result in event.tool_results:
+                            logging.info(f"Processing tool_result #{idx}")
+                            if hasattr(tool_result, 'output'):
+                                output = tool_result.output
+                                logging.info(f"Tool result output type: {type(output)}")
+                                # Convert Pydantic models to dict
+                                if hasattr(output, 'model_dump'):
+                                    execution_result = output.model_dump()
+                                elif hasattr(output, 'dict'):
+                                    execution_result = output.dict()
+                                elif isinstance(output, dict):
+                                    execution_result = output
+                                elif isinstance(output, str):
+                                    # Try to parse as JSON
+                                    try:
+                                        execution_result = json.loads(output)
+                                    except json.JSONDecodeError:
+                                        execution_result = {"raw_output": output}
+                                else:
+                                    execution_result = {"raw_output": str(output)}
+
+                                logging.info(f"✓ Extracted execution_result from tool_results: {execution_result}")
+                                result_found = True
+                                break
+                    
+                    # Check for final response content
+                    if not result_found and hasattr(event, 'is_final_response') and event.is_final_response():
+                        logging.info("Checking final_response event")
+                        if hasattr(event, 'content') and event.content:
+                            if hasattr(event.content, 'parts') and event.content.parts:
+                                logging.info(f"Final response has {len(event.content.parts)} parts")
+                                for idx, part in enumerate(event.content.parts):
+                                    logging.info(f"Processing part #{idx}, type: {type(part)}")
+                                    
+                                    # Check for text content
+                                    if hasattr(part, 'text') and part.text:
+                                        text_content = part.text
+                                        logging.info(f"Found text content (first 200 chars): {text_content[:200]}")
+                                        
+                                        # Try to parse as JSON
+                                        try:
+                                            parsed = json.loads(text_content)
+                                            if isinstance(parsed, dict):
+                                                execution_result = parsed
+                                                logging.info(f"✓ Parsed JSON from text part: {execution_result}")
+                                                result_found = True
+                                                break
+                                        except json.JSONDecodeError as e:
+                                            logging.warning(f"Could not parse text as JSON: {e}")
+                                            # Store as raw text if it looks like a response
+                                            if "status" in text_content.lower():
+                                                execution_result = {"raw_text": text_content}
+                                                result_found = True
+                    
+                    # Break out of the loop if we found a result
+                    if result_found:
+                        logging.info("✓ Result found, breaking out of event loop")
+                        break
+                
+                # If we didn't get any result, set a default error
+                if not execution_result:
+                    logging.error("❌ No execution result received from remote agent")
+                    execution_result = {
+                        "status": "NO_RESPONSE",
+                        "error": "Remote agent did not return any result"
+                    }
+                else:
+                    logging.info(f"✓ Final execution_result status: {execution_result.get('status', 'UNKNOWN')}")
                     # Clean up the temporary A2A session
-                    await self.session_service.delete_session(a2a_session_id)
+                    try:
+                        await self.session_service.delete_session(a2a_session_id)
+                        logging.info(f"✓ Cleaned up A2A session: {a2a_session_id}")
+                    except Exception as cleanup_error:
+                        logging.warning(f"Could not clean up A2A session: {cleanup_error}")
                                     
             except Exception as e:
                 logging.error(f"Error during A2A delegation: {e}", exc_info=True)
-                execution_result = {"status": "DELEGATION_ERROR", "error": str(e)}
+                execution_result = {"status": "DELEGATION_ERROR", "error": str(e), "error_type": type(e).__name__}
                 # Clean up session even on error
                 try:
                     await self.session_service.delete_session(a2a_session_id)
@@ -296,7 +344,7 @@ class IAMOrchestrator(LlmAgent):
             return {"status": "REJECTED", "reason": f"NLU classified response as {nlu_result.get('status')}"}
         
     def _generate_audit_narrative(self, session_id: str, data: Dict[str, Any]) -> str:
-        """Generates a human-readable summary for audit and XAI purposes. [8]"""
+        """Generates a human-readable summary for audit and XAI purposes."""
 
         # This function synthesizes the entire decision process for compliance officers.
         summary = [
