@@ -428,8 +428,6 @@ class IAMProvisioningResponse(BaseModel):
 - **Emergency Stop Mechanism**: Security kill switch
 - **Production Error Handling**: Comprehensive retry and recovery logic
 
-**See**: `PMO/gap analysis.txt` for detailed gap analysis
-
 ---
 
 ## Testing & Simulation
@@ -539,13 +537,6 @@ gcloud run deploy iam-orchestrator \
 - ✅ Time-based policy violations
 - ✅ Unauthorized approver bypass (via Firestore validation)
 - ✅ Audit trail tampering (write-once pattern)
-
-**Requires Additional Hardening**:
-- ⚠️ Prompt injection attacks (input sanitization needed)
-- ⚠️ Replay attacks (nonce/timestamp validation needed)
-- ⚠️ DDoS protection (rate limiting needed)
-
----
 
 ## Monitoring & Observability
 
