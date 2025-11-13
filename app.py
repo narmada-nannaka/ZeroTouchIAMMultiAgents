@@ -18,10 +18,18 @@ logging.basicConfig(level=logging.INFO)
 PROJECT_ID = os.environ.get("PROJECT_ID")
 # CRITICAL: This is the URL we injected during the deploy command!
 A2A_PROVISIONER_URL = os.environ.get("A2A_PROVISIONER_URL")
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "global")
+RAG_ENGINE_ID = os.environ.get("RAG_ENGINE_ID")
+RAG_DATA_STORE_ID = os.environ.get("RAG_DATA_STORE_ID")
+
 
 if not PROJECT_ID or not A2A_PROVISIONER_URL:
     logging.error("Missing required environment variables (PROJECT_ID or A2A_PROVISIONER_URL).")
     raise EnvironmentError("Deployment environment variables are not set correctly.")
+
+if not RAG_ENGINE_ID or not RAG_DATA_STORE_ID:
+    logging.error("Missing required RAG configuration (RAG_ENGINE_ID or RAG_DATA_STORE_ID).")
+    raise EnvironmentError("RAG configuration environment variables are not set correctly.")
 
 # Normalize to https and strip trailing slash
 if A2A_PROVISIONER_URL.startswith("http://"):
@@ -198,6 +206,9 @@ logging.info(f"Initializing IAMOrchestrator for Project: {PROJECT_ID}")
 orchestrator_agent = IAMOrchestrator.create(
     project_id=PROJECT_ID,
     provisioning_service_url=A2A_PROVISIONER_URL,
+    gcp_location=GCP_LOCATION,
+    rag_engine_id=RAG_ENGINE_ID,
+    rag_data_store_id=RAG_DATA_STORE_ID,
     session_service=session_service
 )
 
@@ -259,6 +270,7 @@ async def start_provisioning_endpoint(request):
     user_id = data.get("user_id")
     requested_role = data.get("requested_role")
     project_scope = data.get("project_scope")
+    user_timezone = data.get("user_timezone", 'UTC')
 
     # Persist the provisioning request to Firestore before processing
     try:
@@ -282,7 +294,8 @@ async def start_provisioning_endpoint(request):
             session_id=session_id,
             user_id=user_id,
             requested_role=requested_role,
-            project_scope=project_scope
+            project_scope=project_scope,
+            user_timezone=user_timezone
         )
 
         # Update the provisioning request status in Firestore

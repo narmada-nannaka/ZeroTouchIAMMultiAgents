@@ -39,17 +39,14 @@ class IAMOrchestrator(LlmAgent):
     """
 
     @classmethod
-    def create(cls, project_id: str, provisioning_service_url: str, session_service: BaseSessionService):
+    def create(cls, project_id: str, provisioning_service_url: str, gcp_location: str, rag_engine_id: str, rag_data_store_id: str, session_service: BaseSessionService):
         """
         Factory method to create IAMOrchestrator with external dependencies.
         This avoids Pydantic validation errors when passing non-field parameters.
         """
-
-        RAG_CORPUS_ID = "IAM-Policy-Corpus"  # Confirmed Corpus ID
-
         # Build sub-agents
         lookup_agent = ApproverLookupAgent(project_id=project_id)
-        context_agent = PolicyContextAgent(project_id=project_id, corpus_id=RAG_CORPUS_ID)
+        context_agent = PolicyContextAgent(project_id=project_id, location=gcp_location, engine_id=rag_engine_id, data_store_id=rag_data_store_id)
         nlu_agent = NLUClassifierAgent(project_id=project_id)
 
         # Remote A2A client
@@ -79,13 +76,13 @@ class IAMOrchestrator(LlmAgent):
 
         return instance
     
-    async def start_provisioning(self, session_id: str, user_id: str, requested_role: str, project_scope: str) -> Dict[str, Any]:
+    async def start_provisioning(self, session_id: str, user_id: str, requested_role: str, project_scope: str, user_timezone: str = 'UTC') -> Dict[str, Any]:
         """
         Initial method called by the Pub/Sub trigger. Initiates the workflow.
         """
         
         session = await self.session_service.create_session(session_id=session_id, app_name=self.name, user_id=user_id)
-        session.state['request'] = { "user_id": user_id, "role": requested_role, "scope": project_scope, "status": "LOOKUP_INITIATED" }
+        session.state['request'] = { "user_id": user_id, "role": requested_role, "scope": project_scope, "user_timezone": user_timezone, "status": "LOOKUP_INITIATED" }
         logging.info(f"[{session_id}] Provisioning started. Delegating lookup...")
         
         # --- 2. Delegate Lookup  ---
@@ -99,14 +96,16 @@ class IAMOrchestrator(LlmAgent):
         # --- 3. Delegate RAG Retrieval & Compliance Check ---
         context_agent = self.find_agent("PolicyContextAgent")
         doc_id = lookup_result.get("baseline_policy_doc_id", "NOT_FOUND")
+        role_id = lookup_result.get("role_id", "NOT_FOUND")
 
         # Execute RAG Retrieval ( _retrieve_policy_text)
         rag_tool_func = _get_tool_func(context_agent, "_retrieve_policy_text")
-        policy_context = rag_tool_func(doc_id=doc_id)
+        policy_context = rag_tool_func(doc_type=doc_id, requested_role=role_id)
 
-        # Execute Compliance Check (_check_temporal_compliance)
+        # Execute Compliance Check (_check_temporal_compliance) using detected constraint type
         check_tool_func = _get_tool_func(context_agent, "_check_temporal_compliance")
-        is_compliant, compliance_reason = check_tool_func(constraint_type=policy_context.get("constraint_type"))
+        constraint_type = policy_context.get("constraint_type", "guardrail_deny")  # Fail-safe default
+        is_compliant, compliance_reason = check_tool_func(constraint_type=constraint_type, user_timezone=user_timezone)
 
         # --- 4. Enforce Compliance Guardrail ---
         if not is_compliant:

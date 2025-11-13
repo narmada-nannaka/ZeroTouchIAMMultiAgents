@@ -7,3 +7,5 @@ starlette               # Lightweight framework for ADK service wrapper
 google-auth
 google-auth-oauthlib
 google-cloud-run
+google-cloud-discoveryengine
+pytz
