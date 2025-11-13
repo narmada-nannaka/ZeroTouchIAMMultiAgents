@@ -170,7 +170,7 @@ class IAMOrchestrator(LlmAgent):
             args = {
                 "requested_role": requested_role,
                 "user_id": user_id,
-                "justification": policy_context.get("justification_summary", "No justification provided"),
+                "justification": nlu_result.get("reason_summary", "No Reason provided"),
                 "gcp_project_scope": project_scope
             }
             logging.info(f"[DEBUG] Final args dict: {args}")
