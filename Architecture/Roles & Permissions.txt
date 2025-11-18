@@ -1,0 +1,26 @@
+# Grant Orchestrator permission to invoke the Provisioner service
+gcloud run services add-iam-policy-binding iam-provisioner-service \
+    --member="serviceAccount:${ORCHESTRATOR_SA}" \
+    --role="roles/run.invoker" \
+    --region=YOUR_REGION \
+    --project=${PROJECT_ID}
+
+# Grant Orchestrator access to Firestore (for session management)
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:${ORCHESTRATOR_SA}" \
+    --role="roles/datastore.user"
+
+# Grant Orchestrator access to Vertex AI (for NLU and RAG)
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:${ORCHESTRATOR_SA}" \
+    --role="roles/aiplatform.user"
+
+# Grant Orchestrator access to Discovery Engine (for RAG)
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:${ORCHESTRATOR_SA}" \
+    --role="roles/discoveryengine.viewer"
+
+# Provisioner needs minimal permissions (just logging for now)
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:${PROVISIONER_SA}" \
+    --role="roles/logging.logWriter"

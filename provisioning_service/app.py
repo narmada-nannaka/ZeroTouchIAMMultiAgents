@@ -1,12 +1,15 @@
 import os
 import logging
-# Use absolute import since both files are copied to /app in the container
+from google.auth.transport import requests as auth_requests
+from google.oauth2 import id_token
 from provisioning_agent import IAMProvisioningAgent
 from google.adk.a2a.utils.agent_to_a2a import to_a2a
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.responses import JSONResponse
 from starlette.requests import Request
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 import base64, json
 from datetime import datetime
 
@@ -27,10 +30,13 @@ REQUIRED = ("requested_role", "user_id", "justification", "gcp_project_scope")
 # NEW: Get the service URL from environment (we'll set this during deployment)
 SERVICE_URL = os.environ.get("SERVICE_URL", "")
 
-# if not PROJECT_ID:
-#     # A Cloud Run service must always have a Project ID, or it cannot initialize GCP services.
-#     logger.error("PROJECT_ID environment variable is missing!")
-#     raise EnvironmentError("PROJECT_ID not set")
+# NEW: Expected caller service account
+ALLOWED_CALLER_SA = os.environ.get("ALLOWED_CALLER_SA", "")
+
+# Validation
+if not ALLOWED_CALLER_SA:
+    logger.warning("⚠️ ALLOWED_CALLER_SA not set - service will accept unauthenticated requests!")
+    logger.warning("⚠️ This is INSECURE for production. Set ALLOWED_CALLER_SA environment variable.")
 
 
 logger.info("="*60)
@@ -38,7 +44,106 @@ logger.info(f"Starting IAM Provisioning A2A Service")
 #logger.info(f"PROJECT_ID: {PROJECT_ID}")
 logger.info(f"HOST: {HOST}, PORT: {PORT}")
 logger.info(f"SERVICE_URL: {SERVICE_URL}")
+logger.info(f"ALLOWED_CALLER_SA: {ALLOWED_CALLER_SA}")
 logger.info("="*60)
+
+class ServiceAccountAuthMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to verify that incoming requests are authenticated with
+    the expected service account (Orchestrator).
+    """
+    
+    async def dispatch(self, request: Request, call_next):
+        # Get the full path for accurate matching
+        path = request.url.path
+        
+        # List of public endpoints that don't require authentication
+        public_endpoints = [
+            "/health",
+            "/.well-known/agent.json",
+            "/",  # Root endpoint for service discovery
+        ]
+        
+        # Skip auth for public endpoints
+        if path in public_endpoints:
+            logger.info(f"✅ Public endpoint accessed: {path} (no auth required)")
+            return await call_next(request)
+        
+        # If ALLOWED_CALLER_SA is not configured, allow all requests (dev mode)
+        if not ALLOWED_CALLER_SA:
+            logger.warning("⚠️ No ALLOWED_CALLER_SA configured - allowing unauthenticated request")
+            return await call_next(request)
+        
+        # For protected endpoints, verify authentication
+        logger.info(f"🔐 Protected endpoint accessed: {path} (auth required)")
+        
+        # Extract and verify the Authorization header
+        auth_header = request.headers.get("Authorization", "")
+        
+        if not auth_header.startswith("Bearer "):
+            logger.error("❌ Missing or invalid Authorization header")
+            return JSONResponse(
+                {
+                    "error": "Unauthorized",
+                    "message": "Missing or invalid Authorization header"
+                },
+                status_code=401
+            )
+        
+        token = auth_header.replace("Bearer ", "")
+        
+        try:
+            # Verify the ID token and extract the service account email
+            request_obj = auth_requests.Request()
+            id_info = id_token.verify_oauth2_token(
+                token, 
+                request_obj,
+                audience=SERVICE_URL  # The token must be intended for this service
+            )
+            
+            caller_email = id_info.get("email", "")
+            
+            logger.info(f"🔐 Authenticated request from: {caller_email}")
+            
+            # Verify the caller is the expected service account
+            if caller_email != ALLOWED_CALLER_SA:
+                logger.error(f"❌ Unauthorized service account: {caller_email}")
+                logger.error(f"❌ Expected: {ALLOWED_CALLER_SA}")
+                return JSONResponse(
+                    {
+                        "error": "Forbidden",
+                        "message": f"Service account '{caller_email}' is not authorized to access this service"
+                    },
+                    status_code=403
+                )
+            
+            # Store the verified caller identity in request state for audit trail
+            request.state.authenticated_caller = caller_email
+            
+            # Proceed with the request
+            return await call_next(request)
+            
+        except ValueError as e:
+            # Token verification failed
+            logger.error(f"❌ Token verification failed for {path}: {e}")
+            return JSONResponse(
+                {
+                    "error": "Unauthorized",
+                    "message": "Invalid authentication token"
+                },
+                status_code=401
+            )
+        except Exception as e:
+            # Unexpected error
+            logger.error(f"❌ Authentication error for {path}: {e}", exc_info=True)
+            return JSONResponse(
+                {
+                    "error": "Internal Server Error",
+                    "message": "Authentication verification failed"
+                },
+                status_code=500
+            )
+
 
 def _extract_tool_from_json_dict(d: dict):
     """
@@ -114,7 +219,7 @@ def _parse_tool_from_parts(parts: list):
     return None, {}
 
 # 1. Initialize the Isolated Agent
-#logging.info(f"Initializing IAMProvisioningAgent for Project: {PROJECT_ID}")
+logger.info(f"Initializing IAMProvisioningAgent")
 provisioning_agent = IAMProvisioningAgent()
 logger.info(f"Agent initialized: {provisioning_agent.name}")
 logger.info(f"Agent tools: {[tool.name for tool in provisioning_agent.tools]}")
@@ -129,6 +234,22 @@ async def agent_card_handler(request: Request):
     Serves the A2A agent card at /.well-known/agent.json
     """
     logger.info(f"Agent card requested from: {request.client.host if request.client else 'unknown'}")
+    logger.info(f"   Path: {request.url.path}")
+    logger.info(f"   Full URL: {request.url}")
+
+    #Use SERVICE_URL from environment if set, otherwise construct from headers
+    if SERVICE_URL:
+        base_url = SERVICE_URL
+        logger.info(f"Using SERVICE_URL from environment: {base_url}")
+    else:
+        # Fallback: construct from request headers
+        # Get host from X-Forwarded-Host or Host header
+        host = request.headers.get('x-forwarded-host') or request.headers.get('host') or request.url.netloc
+        
+        # Cloud Run always uses HTTPS externally
+        base_url = f"https://{host}"
+        logger.info(f"Constructed base_url from headers: {base_url}")
+
     
     # Build the agent card following A2A protocol specification
     # Extract tool information
@@ -149,19 +270,6 @@ async def agent_card_handler(request: Request):
         "description": provisioning_agent.description,
         "tags": ["llm"]
     }
-    
-    #Use SERVICE_URL from environment if set, otherwise construct from headers
-    if SERVICE_URL:
-        base_url = SERVICE_URL
-        logger.info(f"Using SERVICE_URL from environment: {base_url}")
-    else:
-        # Fallback: construct from request headers
-        # Get host from X-Forwarded-Host or Host header
-        host = request.headers.get('x-forwarded-host') or request.headers.get('host') or request.url.netloc
-        
-        # Cloud Run always uses HTTPS externally
-        base_url = f"https://{host}"
-        logger.info(f"Constructed base_url from headers: {base_url}")
     
     # Construct full agent card following A2A 0.2.6 specification
     agent_card = {
@@ -192,6 +300,10 @@ async def tasks_send_handler(request: Request):
     Handles A2A task requests (JSON-RPC format)
     This is the standard A2A endpoint for sending tasks
     """
+    #Extract authenticated caller from request state (set by middleware)
+    authenticated_caller = getattr(request.state, 'authenticated_caller', 'UNAUTHENTICATED')
+    logger.info(f"📋 Processing task request from: {authenticated_caller}")
+   
     try:
         body = await request.json()
         logger.info(f"[DEBUG] Raw task request body: {json.dumps(body, indent=2)}")
@@ -241,8 +353,20 @@ async def tasks_send_handler(request: Request):
         # Execute the tool
         for tool in provisioning_agent.tools:
             if tool.name == tool_name or tool.name == "execute_iam_set_tool":
+
+                # Add authenticated caller to audit context
+                logger.info(f"🔧 Executing tool '{tool_name}' on behalf of {authenticated_caller}")
+
                 result = tool.func(**tool_input)
                 logger.info(f"Tool execution result: {result.status}")
+
+                # Serialize the tool result
+                result_data = result.model_dump() if hasattr(result, 'model_dump') else result
+
+                # Inject caller identity into audit trail
+                if isinstance(result_data, dict) and 'audit_trail' in result_data:
+                    if result_data['audit_trail']:
+                        result_data['audit_trail']['authenticated_caller'] = authenticated_caller
                 
                 # CORRECT A2A RESPONSE FORMAT with Task structure
                 request_id = body.get("id", "unknown")
@@ -250,10 +374,6 @@ async def tasks_send_handler(request: Request):
                 timestamp_str = datetime.now().isoformat()
                 message_id = f"msg-{task_id}"
                 context_id = params.get("contextId", f"ctx-{task_id}")
-
-                # Serialize the tool result
-                result_data = result.model_dump() if hasattr(result, 'model_dump') else result
-                result_json = json.dumps(result_data)
 
                 response = {
                     "jsonrpc": "2.0",
@@ -357,6 +477,9 @@ app = Starlette(
         Route('/.well-known/agent.json', agent_card_handler, methods=['GET']),
         Route('/tasks/send', tasks_send_handler, methods=['POST']),
         Route('/health', health_handler, methods=['GET']),
+    ],
+    middleware=[
+        Middleware(ServiceAccountAuthMiddleware)  # Add authentication middleware
     ]
 )
 
