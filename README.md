@@ -75,6 +75,8 @@ The system demonstrates **Zero-Touch IAM Provisioning** - where access requests 
 - Firestore-backed session service for persistent state management
 - Coordinates the 9-step provisioning workflow
 - Maintains audit trail in `provisioning-requests` collection
+- ✅ **NEW**: Integrated Gmail OAuth token support via `token.json`
+- ✅ **NEW**: Automatic fallback to simulation mode if email not configured
 
 **Environment Variables**:
 - `PROJECT_ID`: GCP project identifier
@@ -82,6 +84,9 @@ The system demonstrates **Zero-Touch IAM Provisioning** - where access requests 
 - `GCP_LOCATION`: Region for Vertex AI services (default: global)
 - `RAG_ENGINE_ID`: Vertex AI Search engine ID
 - `RAG_DATA_STORE_ID`: Data store ID for policy documents
+- `SENDER_EMAIL`: Gmail address for sending approval emails (optional)
+- `APPROVAL_CALLBACK_URL`: URL for manual approval callback (optional)
+- `GMAIL_TOKEN_PATH`: Path to Gmail OAuth token file (default: token.json)
 - `PORT`: HTTP server port (default: 8080)
 
 ### 2. IAM Orchestrator Agent (`agents/orchestrator.py`)
@@ -104,6 +109,7 @@ The system demonstrates **Zero-Touch IAM Provisioning** - where access requests 
 - `ApproverLookupAgent`
 - `PolicyContextAgent`
 - `NLUClassifierAgent`
+- `CommunicationAgent` (email helper)
 - `RemoteA2aAgent` (provisioning client)
 
 ### 3. Approver Lookup Agent (`agents/lookup_agent.py`)
@@ -131,33 +137,37 @@ WHERE role_id == <requested_role>
 
 **Features**:
 
-a) **RAG Retrieval** (`_retrieve_policy_text`):
+a) **RAG Retrieval** (`_retrieve_policy_text`) - ✅ **FULLY IMPLEMENTED**:
    - Queries Vertex AI Search with policy document ID
-   - Extracts extractive segments and snippets
+   - Extracts extractive segments and snippets from Discovery Engine
    - Returns policy context with source links
+   - Real integration with Google Cloud Discovery Engine API
+   - Handles both structured and unstructured policy documents
 
-b) **Constraint Detection** (`_detect_constraint_type`):
-   - Analyzes policy text for constraint types:
+b) **Constraint Detection** (`_detect_constraint_type`) - ✅ **FULLY IMPLEMENTED**:
+   - Analyzes policy text for constraint types using regex patterns:
      - `temporal_access_only`: Time-restricted access
      - `guardrail_deny`: Explicitly forbidden
      - `none`: Standard access
+   - Production-ready pattern matching
 
-c) **Temporal Compliance Check** (`_check_temporal_compliance`):
+c) **Temporal Compliance Check** (`_check_temporal_compliance`) - ✅ **FULLY IMPLEMENTED**:
    - Validates access against current time
    - Enforces business hours (Mon-Fri, 08:00-17:00)
-   - Timezone-aware checking
+   - Timezone-aware checking using pytz
    - **Active Guardrail**: Blocks non-compliant requests immediately
+   - Returns detailed compliance reasons for audit trail
 
 **Configuration**:
-- Uses Vertex AI Discovery Engine for RAG
-- Supports extractive content and snippets
+- ✅ Uses Vertex AI Discovery Engine for RAG (real implementation)
+- ✅ Supports extractive content and snippets
 - Configurable via `RAG_ENGINE_ID` and `RAG_DATA_STORE_ID`
 
 ### 5. NLU Classifier Agent (`agents/nlu_classifier_agent.py`)
 
 **Purpose**: Classifies human email responses using Gemini
 
-**Model**: `gemini-2.5-flash` via Vertex AI SDK
+**Model**: `gemini-2.5-flash` via Vertex AI SDK (PRODUCTION-GRADE)
 
 **Input**:
 - `email_body`: Raw email text from approver
@@ -173,6 +183,7 @@ c) **Temporal Compliance Check** (`_check_temporal_compliance`):
 ```
 
 **Features**:
+- ✅ **FULLY IMPLEMENTED** - Uses real Gemini 2.5 Flash via Vertex AI SDK
 - Enforces strict JSON schema via `GenerationConfig`
 - System instruction for impartial classification
 - Exponential backoff retry logic (3 attempts)
@@ -180,7 +191,58 @@ c) **Temporal Compliance Check** (`_check_temporal_compliance`):
 
 **Region**: `asia-southeast1`
 
-### 6. IAM Provisioning Agent (`provisioning_service/provisioning_agent.py`)
+### 6. Communication Agent (`agents/communication_agent.py`)
+
+**Purpose**: ✅ **FULLY IMPLEMENTED** - Sends approval request emails via Gmail API
+
+**Authentication Methods**:
+1. **OAuth User Credentials** (Personal Gmail):
+   - Reads from `token.json` file (generated via `generate_gmail_token.py`)
+   - Supports personal @gmail.com accounts
+   - Includes refresh token for long-term operation
+
+2. **Default Credentials** (Enterprise):
+   - Fallback to service account credentials
+   - For Google Workspace domains
+
+**Key Features**:
+- ✅ Real Gmail API integration using `google-api-python-client`
+- ✅ Async email sending with asyncio thread pool executor
+- ✅ Automatic fallback to simulation mode if credentials missing
+- ✅ Structured email templates with justification context
+- ✅ Returns message metadata (message_id, thread_id) for tracking
+
+**Input Parameters**:
+- `session_id`: Request correlation ID
+- `requester_email`: User requesting access
+- `requested_role`: IAM role being requested
+- `project_scope`: Target GCP project
+- `approvers`: List of approver email addresses
+- `justification`: Policy context for approval decision
+
+**Output**:
+```python
+{
+  "message_id": "gmail-message-id",
+  "thread_id": "gmail-thread-id",
+  "provider": "gmail" | "simulated"
+}
+```
+
+**Email Template Structure**:
+- Subject: `[ACTION REQUIRED] Access request for {requester_email}`
+- Body includes: session ID, requested role, project scope, justification text
+- Instructions for approvers to reply with APPROVED/DENIED
+- Optional callback URL for web-based approval
+
+**Error Handling**:
+- Graceful fallback to simulation mode if:
+  - `SENDER_EMAIL` not configured
+  - Gmail API client initialization fails
+  - OAuth token missing or expired
+- All errors logged with detailed context for troubleshooting
+
+### 7. IAM Provisioning Agent (`provisioning_service/provisioning_agent.py`)
 
 **Purpose**: Isolated, highly-privileged agent for IAM execution
 
@@ -212,28 +274,46 @@ class IAMProvisioningResponse(BaseModel):
 - Returns structured response with audit trail
 - Production would call actual IAM API
 
-### 7. Provisioning Service (`provisioning_service/app.py`)
+### 8. Provisioning Service (`provisioning_service/app.py`)
 
-**Purpose**: A2A server exposing the provisioning agent
+**Purpose**: A2A server exposing the provisioning agent with security middleware
 
 **Endpoints**:
 
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/` | GET | Service information |
-| `/.well-known/agent.json` | GET | A2A agent card |
-| `/tasks/send` | POST | A2A task execution |
-| `/health` | GET | Health check |
+| Endpoint | Method | Purpose | Auth Required |
+|----------|--------|---------|---------------|
+| `/` | GET/POST | Service information / Task delegation | ✅ Yes (POST) |
+| `/.well-known/agent.json` | GET | A2A agent card | No |
+| `/tasks/send` | POST | A2A task execution | ✅ Yes |
+| `/health` | GET | Health check | No |
 
 **A2A Protocol**:
 - Compliant with A2A specification v0.2.6
 - Accepts JSON-RPC format requests
-- Returns structured task responses
-- Supports multiple message part formats (text, JSON, base64)
+- Returns structured task responses with proper Task envelope
+- Supports multiple message part formats (text, JSON, base64, inline_data)
+- Handles tool_calls envelope extraction from various SDK formats
+
+**Security Features** - ✅ **FULLY IMPLEMENTED**:
+- **ServiceAccountAuthMiddleware**: Validates incoming requests
+- ID Token verification via `google.oauth2.id_token`
+- Restricts access to specific service account (`ALLOWED_CALLER_SA`)
+- Public endpoints bypass authentication (health, agent card)
+- Audit trail includes authenticated caller identity
 
 **Configuration**:
-- `SERVICE_URL`: Public URL for agent card
+- `SERVICE_URL`: Public URL for agent card (required for token validation)
+- `ALLOWED_CALLER_SA`: Email of authorized orchestrator service account
 - `PORT`: HTTP server port (default: 8080)
+
+**Middleware Flow**:
+1. Public endpoints → bypass authentication
+2. Protected endpoints → extract Bearer token
+3. Verify token audience matches SERVICE_URL
+4. Extract caller email from ID token
+5. Validate caller matches ALLOWED_CALLER_SA
+6. Inject authenticated_caller into request.state
+7. Include caller in audit trail
 
 ---
 
@@ -296,17 +376,21 @@ class IAMProvisioningResponse(BaseModel):
 ### Core Framework
 - **google-adk[a2a]**: Google Agent Development Kit with A2A support
 - **google-cloud-firestore**: Session and approval data storage
-- **google-cloud-aiplatform**: Vertex AI integration for NLU
-- **google-cloud-discoveryengine**: RAG search capabilities
+- **google-cloud-aiplatform**: Vertex AI integration for NLU (Gemini)
+- **google-cloud-discoveryengine**: RAG search capabilities (Vertex AI Search)
 - **google-cloud-run**: Cloud Run SDK
 
 ### Web Framework
 - **uvicorn[standard]**: ASGI server
 - **starlette**: Lightweight async web framework
 
-### Utilities
+### Communication & Authentication
+- **google-api-python-client**: Gmail API client
 - **google-auth**: GCP authentication
-- **google-auth-oauthlib**: OAuth flows
+- **google-auth-oauthlib**: OAuth flows for personal Gmail
+- **google-auth-httplib2**: HTTP transport for Gmail API
+
+### Utilities
 - **pytz**: Timezone handling for compliance checks
 
 ---
@@ -402,31 +486,34 @@ class IAMProvisioningResponse(BaseModel):
 
 ## Current Implementation Status
 
-### ✅ Completed Features
+### ✅ Completed Features (Production-Grade)
 
-- **Multi-agent orchestration**: 5 specialized agents coordinated by orchestrator
-- **A2A security isolation**: Provisioning agent isolated via A2A protocol
-- **Firestore session management**: Persistent, resumable sessions
-- **RAG policy retrieval**: Integration with Vertex AI Search
-- **Temporal compliance guardrails**: Active enforcement of time restrictions
-- **NLU classification**: Gemini-powered approval classification
+- **Multi-agent orchestration**: 6 specialized agents coordinated by orchestrator
+- **A2A security isolation**: Provisioning agent isolated via A2A protocol with auth middleware
+- **Firestore session management**: Persistent, resumable sessions with custom session service
+- **RAG policy retrieval**: ✅ **REAL** Integration with Vertex AI Search Discovery Engine
+- **Temporal compliance guardrails**: ✅ **ACTIVE** enforcement of time restrictions with timezone support
+- **NLU classification**: ✅ **REAL** Gemini 2.5 Flash via Vertex AI SDK with structured output
+- **Communication Agent**: ✅ **FULLY IMPLEMENTED** Gmail API integration with OAuth2 support
+- **Service Account Authentication**: ✅ **FULLY IMPLEMENTED** ID token validation middleware
 - **Structured audit trails**: Comprehensive logging and narrative generation
 - **Docker containerization**: Ready for Cloud Run deployment
 - **Custom IAM roles**: Least-privilege security model defined
+- **Gmail OAuth Token Generation**: Utility script (`generate_gmail_token.py`) for personal Gmail
 
-### ⚠️ Partially Implemented
+### ⚠️ Simulated Components (Working, but not calling real APIs)
 
-- **Policy Context Agent**: Uses simulated RAG (production: Vertex AI Search)
-- **IAM Provisioning**: Simulated execution (production: real IAM API calls)
-- **JIT Elevation**: Simulated PAM integration (production: requires PAM system)
+- **IAM Provisioning**: Simulated execution (production: real IAM API calls via `setIamPolicy`)
+- **JIT Elevation**: Simulated PAM integration with 5% failure rate (production: requires PAM system)
+- **Approval Response Collection**: Hardcoded simulation (production: Pub/Sub email webhook)
 
 ### ❌ Not Yet Implemented
 
-- **Communication Agent**: Email sending/receiving (planned: Gmail API + Pub/Sub)
-- **Pub/Sub Integration**: Async event handling (planned: Cloud Pub/Sub)
-- **Service Account Isolation**: Separate SAs per privilege level
-- **Emergency Stop Mechanism**: Security kill switch
-- **Production Error Handling**: Comprehensive retry and recovery logic
+- **Pub/Sub Integration**: Async event handling for inbound email responses
+- **Email Response Webhook**: Automatic parsing of approval email replies
+- **Emergency Stop Mechanism**: Security kill switch endpoint
+- **Production Error Handling**: Comprehensive retry and recovery logic for IAM API failures
+- **Real IAM API Calls**: Actual `resourcemanager.projects.setIamPolicy` invocation
 
 ---
 
