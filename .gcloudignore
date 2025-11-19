@@ -1,0 +1,8 @@
+.git
+.gitignore
+pycache/
+venv/
+*.pyc
+.DS_Store
+
+!token.json

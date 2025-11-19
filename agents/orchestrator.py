@@ -4,14 +4,14 @@ from google.adk.agents import LlmAgent
 from agents.lookup_agent import ApproverLookupAgent
 from agents.context_agent import PolicyContextAgent
 from agents.nlu_classifier_agent import NLUClassifierAgent
+from agents.communication_agent import CommunicationAgent
 from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 from google.adk.tools import FunctionTool
 from google.adk.sessions.base_session_service import BaseSessionService
 from google.genai import types 
-import os
 import logging
 import json
-from typing import Dict, Any, Callable
+from typing import Dict, Any, Callable, Optional
 from google.adk.runners import Runner
 
 # Set up logging for visibility
@@ -39,7 +39,9 @@ class IAMOrchestrator(LlmAgent):
     """
 
     @classmethod
-    def create(cls, project_id: str, provisioning_service_url: str, gcp_location: str, rag_engine_id: str, rag_data_store_id: str, session_service: BaseSessionService):
+    def create(cls, project_id: str, provisioning_service_url: str, gcp_location: str, 
+               rag_engine_id: str, rag_data_store_id: str, session_service: BaseSessionService,
+               sender_email: Optional[str] = None, approval_callback_url: Optional[str] = None):
         """
         Factory method to create IAMOrchestrator with external dependencies.
         This avoids Pydantic validation errors when passing non-field parameters.
@@ -71,8 +73,14 @@ class IAMOrchestrator(LlmAgent):
         )
 
         # 5. Attach session service after instantiation by *bypassing* Pydantic's setter
-        # FIX: Use __dict__ to assign directly to the instance object.
-        instance.__dict__['session_service'] = session_service # <-- THIS IS THE CRITICAL CHANGE
+        instance.__dict__['session_service'] = session_service 
+
+        # We treat CommunicationAgent as a helper/service library rather than a full ADK sub-agent
+        # because its logic (sending email) is a side-effect, not a reasoning loop.
+        instance.__dict__['comm_agent'] = CommunicationAgent(
+            sender_email=sender_email,
+            approval_callback_url=approval_callback_url
+        )
 
         return instance
     
@@ -113,9 +121,37 @@ class IAMOrchestrator(LlmAgent):
             session.state['status'] = "POLICY_VIOLATION_REJECTED"
             return {"status": "REJECTED", "reason": compliance_reason}
         
-        # --- 5. Simulate Communication Loop Entry ---
+        # --- 5. Delegate Communication (SEND EMAIL) ---
         
-        # For local testing, we skip email send/wait and simulate the inbound response trigger
+        required_approvers = lookup_result.get("required_approvers", [])
+        if not required_approvers:
+            logging.warning(f"[{session_id}] No approvers found in lookup result. Cannot send email.")
+            # In production, we might fallback to a default admin or fail.
+            # For now, we proceed to simulation or fail.
+        else:
+            try:
+                logging.info(f"[{session_id}] Sending approval email to: {required_approvers}")
+                justification_text = policy_context.get("justification_summary", "No policy justification found.")
+                
+                # Call the communication agent
+                email_result = await self.comm_agent.send_approval_email(
+                    session_id=session_id,
+                    requester_email=user_id,
+                    requested_role=requested_role,
+                    project_scope=project_scope,
+                    approvers=required_approvers,
+                    justification=justification_text
+                )
+                logging.info(f"[{session_id}] Communication result: {email_result}")
+                session.state['email_metadata'] = email_result
+                
+                # In a REAL asynchronous system, we would PAUSE here:
+                # return {"status": "WAITING_FOR_APPROVAL", "message_id": email_result.get('message_id')}
+                
+            except Exception as e:
+                logging.error(f"[{session_id}] Failed to send email: {e}")
+
+        # --- 6. Wait for Response / Inbound Trigger Simulation ---
         
         # SIMULATION INPUT: Approver sends a message back after receiving the justification email
         simulated_approver_email = lookup_result.get("required_approvers") # Use the first approver
@@ -124,7 +160,7 @@ class IAMOrchestrator(LlmAgent):
         
         logging.info(f"[{session_id}] Simulating inbound email from {simulated_approver_email}")
 
-        # --- 6. Delegate to NLU Classifier Agent ---
+         # --- 7. Delegate to NLU Classifier Agent ---
         nlu_agent = self.find_agent("NLUClassifierAgent")
         nlu_tool_func = _get_tool_func(nlu_agent, "classify_intent")
 
@@ -133,7 +169,7 @@ class IAMOrchestrator(LlmAgent):
             sender_email=simulated_approver_email
         )
 
-        # --- 7. Delegate to Secure Execution Agent ---
+        # --- 8. Delegate to Secure Execution Agent ---
 
         if nlu_result.get("status") == "APPROVED":
             
@@ -319,12 +355,13 @@ class IAMOrchestrator(LlmAgent):
                     pass
 
             
-            # --- 7. Final Audit and Response (Task 2) ---
+            # --- 9. Final Audit and Response ---
             
             # Combine all results for the final audit trail
             final_audit_data = {
                 "lookup": lookup_result,
                 "context": policy_context,
+                "email": session.state.get('email_metadata', {}), 
                 "nlu": nlu_result,
                 "execution": execution_result
             }

@@ -4,3 +4,6 @@
 test.ps1
 PMO/
 logs/
+token.json
+agents/__pycache__/
+credentials.json

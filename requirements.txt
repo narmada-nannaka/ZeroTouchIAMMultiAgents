@@ -9,3 +9,5 @@ google-auth-oauthlib
 google-cloud-run
 google-cloud-discoveryengine
 pytz
+google-api-python-client
+google-auth-httplib2

@@ -22,6 +22,9 @@ GCP_LOCATION = os.environ.get("GCP_LOCATION", "global")
 RAG_ENGINE_ID = os.environ.get("RAG_ENGINE_ID")
 RAG_DATA_STORE_ID = os.environ.get("RAG_DATA_STORE_ID")
 
+# --- Communication Config ---
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL") 
+APPROVAL_CALLBACK_URL = os.environ.get("APPROVAL_CALLBACK_URL", "http://localhost:8080/approve")
 
 if not PROJECT_ID or not A2A_PROVISIONER_URL:
     logging.error("Missing required environment variables (PROJECT_ID or A2A_PROVISIONER_URL).")
@@ -30,6 +33,9 @@ if not PROJECT_ID or not A2A_PROVISIONER_URL:
 if not RAG_ENGINE_ID or not RAG_DATA_STORE_ID:
     logging.error("Missing required RAG configuration (RAG_ENGINE_ID or RAG_DATA_STORE_ID).")
     raise EnvironmentError("RAG configuration environment variables are not set correctly.")
+
+if not SENDER_EMAIL:
+    logging.warning("SENDER_EMAIL not set. Communication Agent will run in simulation mode (no real emails sent).")
 
 # Normalize to https and strip trailing slash
 if A2A_PROVISIONER_URL.startswith("http://"):
@@ -43,6 +49,20 @@ PROVISIONING_REQUESTS_COLLECTION = "provisioning-requests" #dedicated collection
 # Get port from environment (Cloud Run sets this)
 PORT = int(os.environ.get("PORT", 8080))
 HOST = os.environ.get("HOST", "0.0.0.0")
+
+# === DEBUG PROBE ===
+logging.info("--- DEBUG: FILE SYSTEM CHECK ---")
+logging.info(f"Current Working Directory: {os.getcwd()}")
+token_path = os.environ.get("GMAIL_TOKEN_PATH", "token.json")
+if os.path.exists(token_path):
+    logging.info(f"SUCCESS: Found token file at {token_path}")
+    # Optional: Print first 10 chars to verify it's not empty
+    with open(token_path, 'r') as f:
+        logging.info(f"Token content preview: {f.read(20)}...")
+else:
+    logging.error(f"FAILURE: Token file NOT found at {token_path}")
+    logging.info(f"Directory listing for {os.getcwd()}: {os.listdir(os.getcwd())}")
+# ===================
 
 # --- 2. CUSTOM FIRESTORE SESSION SERVICE ---
 
@@ -209,7 +229,9 @@ orchestrator_agent = IAMOrchestrator.create(
     gcp_location=GCP_LOCATION,
     rag_engine_id=RAG_ENGINE_ID,
     rag_data_store_id=RAG_DATA_STORE_ID,
-    session_service=session_service
+    session_service=session_service,
+    sender_email=SENDER_EMAIL,
+    approval_callback_url=APPROVAL_CALLBACK_URL
 )
 
 # --- 4. HELPER FUNCTIONS FOR FIRESTORE PERSISTENCE ---
