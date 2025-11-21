@@ -6,7 +6,7 @@ import datetime
 from google.cloud import firestore
 from starlette.applications import Starlette
 from starlette.routing import Route
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, HTMLResponse
 from agents.orchestrator import IAMOrchestrator
 from google.adk.sessions import Session, BaseSessionService
 from typing import Optional
@@ -50,21 +50,7 @@ PROVISIONING_REQUESTS_COLLECTION = "provisioning-requests" #dedicated collection
 PORT = int(os.environ.get("PORT", 8080))
 HOST = os.environ.get("HOST", "0.0.0.0")
 
-# === DEBUG PROBE ===
-logging.info("--- DEBUG: FILE SYSTEM CHECK ---")
-logging.info(f"Current Working Directory: {os.getcwd()}")
-token_path = os.environ.get("GMAIL_TOKEN_PATH", "token.json")
-if os.path.exists(token_path):
-    logging.info(f"SUCCESS: Found token file at {token_path}")
-    # Optional: Print first 10 chars to verify it's not empty
-    with open(token_path, 'r') as f:
-        logging.info(f"Token content preview: {f.read(20)}...")
-else:
-    logging.error(f"FAILURE: Token file NOT found at {token_path}")
-    logging.info(f"Directory listing for {os.getcwd()}: {os.listdir(os.getcwd())}")
-# ===================
-
-# --- 2. CUSTOM FIRESTORE SESSION SERVICE ---
+# --- CUSTOM FIRESTORE SESSION SERVICE ---
 
 class FirestoreSessionService(BaseSessionService):
     """
@@ -110,8 +96,8 @@ class FirestoreSessionService(BaseSessionService):
             "app_name": app_name,
             "user_id": user_id,
             "state": session.state,
-            "created_at": datetime.datetime.utcnow(),
-            "updated_at": datetime.datetime.utcnow()
+            "created_at": datetime.datetime.now(datetime.timezone.utc),
+            "updated_at": datetime.datetime.now(datetime.timezone.utc)
         })
 
         logging.info(f"Created and persisted session: {session_id}")
@@ -158,7 +144,7 @@ class FirestoreSessionService(BaseSessionService):
         doc_ref = self.db.collection(self.collection_name).document(session.id)
         doc_ref.update({
             "state": session.state,
-            "updated_at": datetime.datetime.utcnow()
+            "updated_at": datetime.datetime.now(datetime.timezone.utc)
         })
 
         logging.info(f"Updated session: {session.id}")
@@ -248,7 +234,7 @@ def persist_provisioning_request(session_id: str, user_id: str, requested_role: 
             "requested_role": requested_role,
             "project_scope": project_scope,
             "status": status,
-            "timestamp": datetime.datetime.utcnow(),
+            "timestamp": datetime.datetime.now(datetime.timezone.utc),
             "project_id": PROJECT_ID
         }
 
@@ -294,58 +280,79 @@ async def start_provisioning_endpoint(request):
     project_scope = data.get("project_scope")
     user_timezone = data.get("user_timezone", 'UTC')
 
-    # Persist the provisioning request to Firestore before processing
+    persist_provisioning_request(session_id, user_id, requested_role, project_scope, "INITIATED")
+
     try:
-        persist_provisioning_request(
-            session_id=session_id,
-            user_id=user_id,
-            requested_role=requested_role,
-            project_scope=project_scope,
-            status="INITIATED"
+        result = await orchestrator_agent.start_provisioning(
+            session_id=session_id, user_id=user_id, requested_role=requested_role,
+            project_scope=project_scope, user_timezone=user_timezone
         )
+        update_provisioning_request_status(session_id, result.get("status", "UNKNOWN"), result)
+        return JSONResponse(result)
     except Exception as e:
-        logging.error(f"Failed to persist provisioning request: {e}")
-        return JSONResponse({
-            "status": "ERROR",
-            "error": "Failed to persist provisioning request to Firestore"
-        }, status_code=500)
+        logging.error(f"Error: {e}")
+        update_provisioning_request_status(session_id, "FAILED", {"error": str(e)})
+        return JSONResponse({"status": "ERROR", "error": str(e)}, status_code=500)
+
+async def process_approval_webhook(request):
+    """
+    Handles the click from the email.
+    Generates synthetic text to feed the NLU Agent.
+    """
+    session_id = request.query_params.get('session_id')
+    action = request.query_params.get('action') # APPROVED or DENIED
+    
+    if not session_id or not action:
+        return HTMLResponse("<h1>Error: Invalid Link</h1>", status_code=400)
+
+    logging.info(f"WEBHOOK: Received {action} for session {session_id}")
+    update_provisioning_request_status(session_id, f"HUMAN_CLICKED_{action}")
+
+    # --- GENERATE SYNTHETIC TEXT FOR NLU ---
+    # In a future version, this could come from a HTML text box.
+    if action == "APPROVED":
+        simulated_text = "I have reviewed the policy justification and I explicitly APPROVE this access request."
+    else:
+        simulated_text = "I am REJECTING this request because it violates our internal freeze period."
+    
+    # We assume the approver is the Admin (simplified for prototype)
+    # In prod, we'd verify the token to know exactly who clicked it.
+    approver_identity = SENDER_EMAIL 
 
     # Execute the provisioning workflow
     try:
-        result = await orchestrator_agent.start_provisioning(
+        # Resume the Orchestrator with TEXT, not just a flag
+        result = await orchestrator_agent.resume_with_approval(
             session_id=session_id,
-            user_id=user_id,
-            requested_role=requested_role,
-            project_scope=project_scope,
-            user_timezone=user_timezone
+            raw_response_text=simulated_text, 
+            approver_email=approver_identity
         )
+        
+        status = result.get('status')
+        color = "green" if "APPLIED" in str(status) else "red"
+        
+        html_content = f"""
+        <html>
+            <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+                <h1 style="color: {color};">Decision Processed</h1>
+                <p>The NLU Agent has analyzed your input.</p>
+                <p><strong>Input:</strong> "{simulated_text}"</p>
+                <p><strong>NLU Classification:</strong> {status}</p>
+                <p>You can close this window.</p>
+            </body>
+        </html>
+        """
+        return HTMLResponse(html_content)
 
-        # Update the provisioning request status in Firestore
-        final_status = result.get("status", "UNKNOWN")
-        update_provisioning_request_status(
-            session_id=session_id,
-            status=final_status,
-            result_data=result
-        )
-
-        return JSONResponse(result)
     except Exception as e:
-        logging.error(f"Error during provisioning workflow: {e}")
-        # Update status to FAILED in Firestore
-        update_provisioning_request_status(
-            session_id=session_id,
-            status="FAILED",
-            result_data={"error": str(e)}
-        )
-        return JSONResponse({
-            "status": "ERROR",
-            "error": str(e)
-        }, status_code=500)
+        logging.error(f"Webhook Error: {e}")
+        return HTMLResponse(f"<h1>System Error</h1><p>{e}</p>", status_code=500)
 
 # Create Starlette app with routes
 app = Starlette(
     routes=[
         Route('/start_provisioning', start_provisioning_endpoint, methods=['POST']),
+        Route('/respond', process_approval_webhook, methods=['GET']),
     ]
 )
 

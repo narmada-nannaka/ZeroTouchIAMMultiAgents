@@ -2,7 +2,7 @@
 
 ## Overview
 
-A production-grade, AI-powered IAM (Identity and Access Management) provisioning system built using Google's Agent Development Kit (ADK). This system automates secure, policy-compliant IAM role assignments through an intelligent multi-agent architecture with human-in-the-loop approval workflows.
+A hackathon-grade, AI-assisted IAM (Identity and Access Management) provisioning prototype built using Google's Agent Development Kit (ADK). The goal is to demonstrate how multi-agent orchestration, policy retrieval, and human approvals can be automated end-to-end while keeping privileged IAM execution behind an isolated Agent-to-Agent (A2A) surface.
 
 ## What Has Been Built
 
@@ -14,6 +14,8 @@ This project implements an **autonomous IAM provisioning orchestration system** 
 - **Natural Language Understanding** for email-based approval classification
 - **Temporal compliance guardrails** for time-restricted access
 - **Comprehensive audit trails** for regulatory compliance
+
+Real IAM mutations, PAM/JIT elevation, and inbound email ingestion are currently simulated so the orchestration loop can be exercised safely.
 
 ### Key Innovation
 
@@ -75,8 +77,8 @@ The system demonstrates **Zero-Touch IAM Provisioning** - where access requests 
 - Firestore-backed session service for persistent state management
 - Coordinates the 9-step provisioning workflow
 - Maintains audit trail in `provisioning-requests` collection
-- ✅ **NEW**: Integrated Gmail OAuth token support via `token.json`
-- ✅ **NEW**: Automatic fallback to simulation mode if email not configured
+- Integrates Gmail OAuth token support via `token.json` when available
+- Automatically falls back to simulation mode if email is not configured or Gmail auth fails
 
 **Environment Variables**:
 - `PROJECT_ID`: GCP project identifier

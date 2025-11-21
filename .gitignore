@@ -7,3 +7,4 @@ logs/
 token.json
 agents/__pycache__/
 credentials.json
+orchestrator_key.json
