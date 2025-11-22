@@ -55,7 +55,7 @@ class PolicyContextAgent(LlmAgent):
         # knowledge store, returning a structured summary of the policy.
 
         # The query should combine all context for the best grounding
-        search_query = doc_type
+        search_query = f"What is the policy based on document {doc_type}?"
         
         try:
             client = discoveryengine.SearchServiceClient()
@@ -83,6 +83,18 @@ class PolicyContextAgent(LlmAgent):
                 )
             )
 
+            # Ask Vertex AI Search to generate a concise server-side summary
+            summary_spec = discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec(
+                summary_result_count=1,
+                include_citations=False,
+                ignore_adversarial_query=True,
+                ignore_non_summary_seeking_query=False,
+                # Add a prompt to guide the model's summary length
+                model_prompt_spec=discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec.ModelPromptSpec(
+                    preamble="Generate a very concise summary, strictly under 100 characters, explaining the core policy."
+                )
+            )
+
             # Build proper filter syntax for document ID field
             # Use the document id field directly instead of structData
             filter_str = f'policy_id: ANY("{doc_type}")'
@@ -92,8 +104,12 @@ class PolicyContextAgent(LlmAgent):
                     serving_config=serving_config_name,
                     query=search_query,
                     filter=filter_str,
-                    page_size=3,
-                    content_search_spec=content_search_spec  # ADD THIS!
+                    page_size=3, # In many library versions, summary_spec is part of content_search_spec
+                    content_search_spec=discoveryengine.SearchRequest.ContentSearchSpec(
+                        snippet_spec=content_search_spec.snippet_spec,
+                        summary_spec=summary_spec,
+                        extractive_content_spec=content_search_spec.extractive_content_spec
+                    ),
                 )
             )
 
@@ -212,7 +228,8 @@ class PolicyContextAgent(LlmAgent):
             constraint_type = self._detect_constraint_type(rag_context)
 
             # Extract justification summary from policy text (first 200 chars)
-            justification_summary = rag_context[:200] + "..." if len(rag_context) > 200 else rag_context
+            #justification_summary = rag_context[:200] + "..." if len(rag_context) > 200 else rag_context
+            justification_summary = self._build_justification_summary(response, rag_context)
 
             return {
                 "rag_context": rag_context,
@@ -234,6 +251,38 @@ class PolicyContextAgent(LlmAgent):
                 "justification_summary": "Policy retrieval failed - access denied by default",
                 "baseline_policy_doc_id": doc_type
         }
+
+    def _build_justification_summary(self, response, fallback_text: str, max_chars: int = 200) -> str:
+        """
+        Attempts to use the Vertex AI search response summary. Falls back to retrieved policy text when summarization is unavailable. 
+        """
+        summary_text = ""
+        summary = getattr(response, "summary", None)
+
+        if summary:
+            summary_text = getattr(summary, "summary_text", "") or getattr(summary, "summary", "")
+            if not summary_text and hasattr(summary, "summary_texts"):
+                summary_texts = getattr(summary, "summary_texts")
+                if summary_texts:
+                    first_summary = summary_texts[0]
+                    summary_text = getattr(first_summary, "text", "") or first_summary.get("text", "") if isinstance(first_summary, dict) else ""
+        
+            if not summary_text:
+                try:
+                    summary_dict = MessageToDict(summary)
+                    summary_texts = summary_dict.get("summaryTexts", []) or summary_dict.get("summary_texts", [])
+                    if summary_texts:
+                        summary_text = summary_texts[0].get("text", "")
+                    elif summary_dict.get("summaryText"):
+                        summary_text = summary_dict["summaryText"]
+                except Exception as e:
+                    logging.debug(f"Unable to parse summary text from response: {e}")
+
+        final_summary = summary_text.strip() if summary_text else fallback_text.strip()
+
+        if len(final_summary) > max_chars:
+            return final_summary[:max_chars].rstrip() + "..."
+        return final_summary        
         
     def _detect_constraint_type(self, policy_text: str) -> str:
         """

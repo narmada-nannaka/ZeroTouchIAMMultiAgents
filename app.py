@@ -257,7 +257,7 @@ def update_provisioning_request_status(session_id: str, status: str, result_data
         doc_ref = db.collection(PROVISIONING_REQUESTS_COLLECTION).document(session_id)
         update_data = {
             "status": status,
-            "updated_at": datetime.datetime.utcnow()
+            "updated_at": datetime.datetime.now(datetime.timezone.utc)
         }
 
         if result_data:
