@@ -10,6 +10,9 @@ from google.adk.sessions.base_session_service import BaseSessionService
 from google.genai import types 
 import logging
 import json
+import httpx
+import google.auth.transport.requests
+import google.oauth2.id_token
 from typing import Dict, Any, Callable, Optional
 from google.adk.runners import Runner
 
@@ -50,10 +53,44 @@ class IAMOrchestrator(LlmAgent):
         context_agent = PolicyContextAgent(project_id=project_id, location=gcp_location, engine_id=rag_engine_id, data_store_id=rag_data_store_id)
         nlu_agent = NLUClassifierAgent(project_id=project_id)
 
+        # Normalise to base URL - handle potential empty or None string
+        base_url = (provisioning_service_url or "").rstrip("/")
+        if not base_url:
+            logging.warning("⚠️ provisioning_service_url is empty! Remote agent calls will fail.")
+
+        # Create custom auth class that refreshes tokens automatically
+        class GCPAuth(httpx.Auth):
+            """Custom httpx Auth class for GCP OIDC tokens"""
+            def __init__(self, audience: str):
+                self.audience = audience
+                
+            def auth_flow(self, request):
+                """Add Authorization header with fresh OIDC token to each request"""
+                try:
+                    # Skip token generation if audience is missing (prevents crash on local dev)
+                    if not self.audience:
+                        logging.warning("⚠️ No audience set for GCPAuth - skipping token generation")
+                        yield request
+                        return
+                    auth_req = google.auth.transport.requests.Request()
+                    token = google.oauth2.id_token.fetch_id_token(auth_req, self.audience)
+                    request.headers['Authorization'] = f'Bearer {token}'
+                    logging.info(f"🔐 Added auth token to request: {request.url}")
+                except Exception as e:
+                    logging.error(f"❌ Failed to add auth token: {e}")
+                    # Continue anyway - let the server reject it with proper error
+                yield request
+
+        # Create authenticated httpx client
+        authenticated_client = httpx.AsyncClient(
+            auth=GCPAuth(audience=base_url),
+            timeout=60.0,  # Increase timeout for IAM operations
+            follow_redirects=True
+        )
+
         # Remote A2A client
         # RemoteA2aAgent will fetch the agent_card from the provisioning service URL automatically
-        agent_card_url = f"{provisioning_service_url}/.well-known/agent.json"
-
+        agent_card_url = f"{base_url}/.well-known/agent.json"
         logging.info(f"Initializing RemoteA2aAgent with agent card URL: {agent_card_url}")
 
         
@@ -61,6 +98,7 @@ class IAMOrchestrator(LlmAgent):
             name="iam_provisioner_client",
             description="Remote agent that handles secure IAM provisioning operations",
             agent_card=agent_card_url,  # Pass URL as string - RemoteA2aAgent will fetch agent_card
+            httpx_client=authenticated_client,
         )
 
        # 4. Instantiate the Agent (Pydantic Validation happens here)
@@ -325,7 +363,7 @@ class IAMOrchestrator(LlmAgent):
                 # check if this is the final response
                 if hasattr(event, 'tool_results') and event.tool_results:
                     logging.info(f"✓ Found {len(event.tool_results)} tool_results in event")
-                    for tool_result in event.tool_results:
+                    for idx, tool_result in enumerate(event.tool_results):
                         logging.info(f"Processing tool_result #{idx}")
                         if hasattr(tool_result, 'output'):
                             output = tool_result.output

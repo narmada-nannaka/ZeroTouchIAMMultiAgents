@@ -57,13 +57,13 @@ class IAMProvisioningAgent(LlmAgent):
             # Validate that gcp_project_scope is provided
             if not gcp_project_scope:
                 logger.error("Missing required parameter: gcp_project_scope")
-                return {
-                    "status": "PARAMETER_ERROR",
-                    "timestamp": datetime.datetime.now().isoformat(),
-                    "reason": "Missing required parameter: gcp_project_scope",
-                    "applied_policy": None,
-                    "audit_trail": None
-                }
+                return IAMProvisioningResponse(
+                    status="PARAMETER_ERROR",
+                    timestamp=datetime.datetime.now().isoformat(),
+                    reason="Missing required parameter: gcp_project_scope",
+                    applied_policy=None,
+                    audit_trail=None
+                )
 
             return self._perform_iam_set(requested_role, user_id, safe_justification, gcp_project_scope)
 

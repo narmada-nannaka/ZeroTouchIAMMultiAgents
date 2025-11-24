@@ -28,7 +28,7 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 REQUIRED = ("requested_role", "user_id", "justification", "gcp_project_scope")
 
 # NEW: Get the service URL from environment (we'll set this during deployment)
-SERVICE_URL = os.environ.get("SERVICE_URL", "")
+SERVICE_URL = os.environ.get("SERVICE_URL", "").rstrip("/")
 
 # NEW: Expected caller service account
 ALLOWED_CALLER_SA = os.environ.get("ALLOWED_CALLER_SA", "")
@@ -55,31 +55,32 @@ class ServiceAccountAuthMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next):
         # Get the full path for accurate matching
-        path = request.url.path
+        raw_path = request.url.path
+        path = raw_path.rstrip("/")
         
         # List of public endpoints that don't require authentication
         public_endpoints = [
             "/health",
             "/.well-known/agent.json",
-            "/",  # Root endpoint for service discovery
         ]
         
-        # Skip auth for public endpoints
+        logger.debug(f"🔍 Middleware processing: '{raw_path}' (Normalized: '{path}')")
+
+        is_public = False
         if path in public_endpoints:
-            logger.info(f"✅ Public endpoint accessed: {path} (no auth required)")
-            return await call_next(request)
+            is_public = True
+        elif path == "" and request.method == "GET":
+            is_public = True
         
-        # If ALLOWED_CALLER_SA is not configured, allow all requests (dev mode)
-        if not ALLOWED_CALLER_SA:
-            logger.warning("⚠️ No ALLOWED_CALLER_SA configured - allowing unauthenticated request")
-            return await call_next(request)
-        
+        # Skip auth for public endpoints        
+        if is_public:
+             logger.info(f"✅ Public endpoint accessed: {raw_path}")
+             return await call_next(request)
+               
         # For protected endpoints, verify authentication
         logger.info(f"🔐 Protected endpoint accessed: {path} (auth required)")
-        
         # Extract and verify the Authorization header
         auth_header = request.headers.get("Authorization", "")
-        
         if not auth_header.startswith("Bearer "):
             logger.error("❌ Missing or invalid Authorization header")
             return JSONResponse(
@@ -89,9 +90,7 @@ class ServiceAccountAuthMiddleware(BaseHTTPMiddleware):
                 },
                 status_code=401
             )
-        
         token = auth_header.replace("Bearer ", "")
-        
         try:
             # Verify the ID token and extract the service account email
             request_obj = auth_requests.Request()
@@ -100,9 +99,8 @@ class ServiceAccountAuthMiddleware(BaseHTTPMiddleware):
                 request_obj,
                 audience=SERVICE_URL  # The token must be intended for this service
             )
-            
             caller_email = id_info.get("email", "")
-            
+        
             logger.info(f"🔐 Authenticated request from: {caller_email}")
             
             # Verify the caller is the expected service account
@@ -115,14 +113,12 @@ class ServiceAccountAuthMiddleware(BaseHTTPMiddleware):
                         "message": f"Service account '{caller_email}' is not authorized to access this service"
                     },
                     status_code=403
-                )
-            
+                )        
             # Store the verified caller identity in request state for audit trail
             request.state.authenticated_caller = caller_email
-            
             # Proceed with the request
             return await call_next(request)
-            
+        
         except ValueError as e:
             # Token verification failed
             logger.error(f"❌ Token verification failed for {path}: {e}")
