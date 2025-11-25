@@ -85,64 +85,85 @@ class CommunicationAgent:
         # We assume callback_url is like "https://service-url.run.app"
         # The route we added in app.py is "/respond"
         
-        approve_link = f"{base_url}/respond?session_id={session_id}&action=APPROVED"
-        deny_link = f"{base_url}/respond?session_id={session_id}&action=DENIED"
-
-        subject = f"[ACTION REQUIRED] Access request for {requester_email}"
+        results = []
         
-        # Use HTML Body for buttons
-        html_body = f"""
-        <html>
-        <body>
-            <h2>IAM Access Request</h2>
-            <p><strong>User:</strong> {requester_email}</p>
-            <p><strong>Role:</strong> {requested_role}</p>
-            <p><strong>Scope:</strong> {project_scope}</p>
-            <p><strong>Session ID:</strong> {session_id}</p>
-            <div style="background-color: #f9f9f9; padding: 15px; border-left: 4px solid #2196F3; margin: 20px 0;">
-                <strong>Policy Justification (AI Generated):</strong><br/>
-                {justification or "None provided."}
-            </div>
+        # --- LOOP CHANGE: Send individual email to each approver ---
+        for approver in approvers:
             
-            <p>Please authorize this request:</p>
-            <div style="margin-top: 20px;">
-                <a href="{approve_link}" style="background-color: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin-right: 10px;">APPROVE ACCESS</a>
-                <a href="{deny_link}" style="background-color: #f44336; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">DENY REQUEST</a>
-            </div>
-            <p style="font-size: 12px; color: gray; margin-top: 30px;">Zero-Touch IAM Orchestrator Bot</p>
-        </body>
-        </html>
-        """
+            # 1. Generate UNIQUE Links for this specific approver
+            # This fixes the parameter passing issue
+            approve_link = f"{base_url}/respond?session_id={session_id}&action=APPROVED&approver_email={approver}"
+            deny_link = f"{base_url}/respond?session_id={session_id}&action=DENIED&approver_email={approver}"
 
-        payload = {
-            "subject": subject,
-            "body": html_body, # Pass HTML content
-            "approvers": approvers,
-            "session_id": session_id,
-        }
+            subject = f"[ACTION REQUIRED] Access request for {requester_email}"
+            # Use HTML Body for buttons
+            html_body = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif;">
+                    <h2 style="color: #1a73e8;">IAM Access Request</h2>
+                    <p><strong>User:</strong> {requester_email}</p>
+                    <p><strong>Role:</strong> {requested_role}</p>
+                    <p><strong>Scope:</strong> {project_scope}</p>
+                    
+                    <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #1a73e8; margin: 20px 0;">
+                        <strong>Policy Justification (AI Generated):</strong><br/>
+                        {justification_text}
+                    </div>
+                    
+                    <p>As the designated approver, {approver}, please verify this request:</p>
+                    
+                    <div style="margin-top: 25px;">
+                        <a href="{approve_link}" style="background-color: #1e8e3e; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold; margin-right: 15px;">APPROVE</a>
+                        <a href="{deny_link}" style="background-color: #d93025; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">DENY</a>
+                    </div>
+                    
+                    <p style="font-size: 12px; color: #5f6368; margin-top: 40px;">
+                        Session ID: {session_id}<br>
+                        Zero-Touch IAM Orchestrator
+                    </p>
+                </body>
+            </html>
+            """
 
-        if not self.sender_email or not self._gmail_service:
-            # Diagnostic logging
-            reason = self._init_error if self._init_error else "Configuration missing"
-            logging.warning(f"COMM AGENT: Falling back to SIMULATION. Reason: {reason}")
-            
-            return {
-                "message_id": f"simulated-{session_id}",
-                "thread_id": f"thread-{session_id}",
-                "provider": "simulated",
+            payload = {
+                "subject": subject,
+                "body": html_body, # Pass HTML content
+                "recipient": approver,
+                "session_id": session_id,
             }
 
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            self._send_via_gmail,
-            payload,
-        )
+            # --- 2. SIMULATION MODE CHECK (Your requested feature) ---
+            if not self.sender_email or not self._gmail_service:
+                logging.warning(f"⚠️ [SIMULATION] Sending to {approver}")
+                logging.warning(f"🔗 CLICK TO APPROVE: {approve_link}")
+                
+                results.append({
+                    "approver": approver, 
+                    "status": "simulated", 
+                    "link": approve_link # Useful for debugging
+                })
+                continue # Skip actual sending
+
+            # Send Real Email
+            loop = asyncio.get_running_loop()
+            try:
+                res = await loop.run_in_executor(None, self._send_via_gmail, payload)
+                results.append(res)
+            except Exception as e:
+                logging.error(f"Failed to send to {approver}: {e}")
+                results.append({"approver": approver, "status": "failed", "error": str(e)})
+
+        # Return summary
+        return {
+            "status": "partial_success" if any(r.get("status") == "failed" for r in results) else "sent",
+            "details": results,
+            "count": len(results)
+        }
 
     def _send_via_gmail(self, payload: Dict[str, str]) -> Dict[str, str]:
         """Blocking Gmail API call executed in a thread pool."""
         message = MIMEMultipart("alternative")
-        message["to"] = ", ".join(payload["approvers"])
+        message["to"] = (payload["recipient"])
         message["from"] = self.sender_email
         message["subject"] = payload["subject"]
         
@@ -163,6 +184,8 @@ class CommunicationAgent:
                 "message_id": result.get("id", ""),
                 "thread_id": result.get("threadId", ""),
                 "provider": "gmail",
+                "approver": payload["recipient"],
+                "status": "sent"
             }
         except HttpError as http_error:
             logging.error("COMM AGENT: Gmail send failed: %s", http_error)

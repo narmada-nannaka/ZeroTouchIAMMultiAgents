@@ -33,12 +33,6 @@ SERVICE_URL = os.environ.get("SERVICE_URL", "").rstrip("/")
 # NEW: Expected caller service account
 ALLOWED_CALLER_SA = os.environ.get("ALLOWED_CALLER_SA", "")
 
-# Validation
-if not ALLOWED_CALLER_SA:
-    logger.warning("⚠️ ALLOWED_CALLER_SA not set - service will accept unauthenticated requests!")
-    logger.warning("⚠️ This is INSECURE for production. Set ALLOWED_CALLER_SA environment variable.")
-
-
 logger.info("="*60)
 logger.info(f"Starting IAM Provisioning A2A Service")
 #logger.info(f"PROJECT_ID: {PROJECT_ID}")

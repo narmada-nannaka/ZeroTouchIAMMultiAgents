@@ -3,10 +3,13 @@
 import os
 import logging
 import datetime
+import base64, json, uuid
 from google.cloud import firestore
+from google.cloud import pubsub_v1
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.responses import JSONResponse, HTMLResponse
+from starlette.requests import Request
 from agents.orchestrator import IAMOrchestrator
 from google.adk.sessions import Session, BaseSessionService
 from typing import Optional
@@ -16,15 +19,13 @@ logging.basicConfig(level=logging.INFO)
 
 # Retrieve configuration from environment variables
 PROJECT_ID = os.environ.get("PROJECT_ID")
-# CRITICAL: This is the URL we injected during the deploy command!
 A2A_PROVISIONER_URL = os.environ.get("A2A_PROVISIONER_URL")
 GCP_LOCATION = os.environ.get("GCP_LOCATION", "global")
 RAG_ENGINE_ID = os.environ.get("RAG_ENGINE_ID")
 RAG_DATA_STORE_ID = os.environ.get("RAG_DATA_STORE_ID")
-
-# --- Communication Config ---
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL") 
 APPROVAL_CALLBACK_URL = os.environ.get("APPROVAL_CALLBACK_URL", "http://localhost:8080/approve")
+IAM_TOPIC_ID = os.environ.get("IAM_TOPIC_ID", "iam-request-topic")
 
 if not PROJECT_ID or not A2A_PROVISIONER_URL:
     logging.error("Missing required environment variables (PROJECT_ID or A2A_PROVISIONER_URL).")
@@ -207,6 +208,10 @@ session_service = FirestoreSessionService(
 )
 logging.info(f"Initialized FirestoreSessionService with collection: {ADK_SESSION_DB}")
 
+publisher = pubsub_v1.PublisherClient()
+topic_path = publisher.topic_path(PROJECT_ID, IAM_TOPIC_ID)
+logging.info(f"Pub/Sub Publisher configured for: {topic_path}")
+
 # Initialize the Orchestrator Agent with session service using factory method
 logging.info(f"Initializing IAMOrchestrator for Project: {PROJECT_ID}")
 orchestrator_agent = IAMOrchestrator.create(
@@ -220,7 +225,67 @@ orchestrator_agent = IAMOrchestrator.create(
     approval_callback_url=APPROVAL_CALLBACK_URL
 )
 
-# --- 4. HELPER FUNCTIONS FOR FIRESTORE PERSISTENCE ---
+# --- 4. Dashboard HTML (Entry Point) ---
+
+NAV_BAR = """
+<div style="margin-bottom: 20px; border-bottom: 1px solid #ddd; padding-bottom: 10px;">
+    <a href="/" style="text-decoration: none; font-weight: bold; color: #1a73e8; margin-right: 20px;">New Request</a>
+    <a href="/status" style="text-decoration: none; font-weight: bold; color: #1a73e8;">Live Status Dashboard</a>
+</div>
+"""
+
+DASHBOARD_HTML = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Zero-Touch IAM Portal</title>
+    <style>
+        body {{ font-family: 'Segoe UI', sans-serif; background-color: #f4f6f8; padding: 40px; }}
+        .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
+        h1 {{ color: #1a73e8; text-align: center; }}
+        .form-group {{ margin-bottom: 20px; }}
+        label {{ display: block; margin-bottom: 8px; font-weight: 600; color: #333; }}
+        input, select, textarea {{ width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; }}
+        button {{ width: 100%; padding: 14px; background-color: #1a73e8; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; transition: background 0.3s; }}
+        button:hover {{ background-color: #1557b0; }}
+        .note {{ font-size: 0.9em; color: #666; margin-top: 10px; text-align: center; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        {NAV_BAR}
+        <h1>IAM Access Request</h1>
+        <form action="/manual_trigger" method="post">
+            <div class="form-group">
+                <label>User Email (Identity)</label>
+                <input type="email" name="user_id" placeholder="employee@example.com" required>
+            </div>
+            <div class="form-group">
+                <label>Requested Role</label>
+                <input type="text" name="requested_role" placeholder="roles/storage.admin" required>
+                <p class="note" style="text-align: left; margin-top: 5px;">Must match a '_id' in your Firestore configuration.</p>
+            </div>
+            <div class="form-group">
+                <label>Target Project Scope</label>
+                <input type="text" name="project_scope" placeholder="my-gcp-project-id" required>
+            </div>
+            <div class="form-group">
+                <label>Business Justification</label>
+                <textarea name="justification" rows="3" placeholder="Why is this access needed?" required></textarea>
+            </div>
+            <div class="form-group">
+                <label>User Timezone</label>
+                <input type="text" name="user_timezone" value="UTC">
+            </div>
+            <button type="submit">🚀 Queue Provisioning Request</button>
+            <p class="note">This event will be published to the Cloud Pub/Sub queue.</p>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+# 5. HELPER FUNCTIONS FOR FIRESTORE PERSISTENCE ---
 
 def persist_provisioning_request(session_id: str, user_id: str, requested_role: str, project_scope: str, status: str = "INITIATED"):
     """
@@ -241,9 +306,7 @@ def persist_provisioning_request(session_id: str, user_id: str, requested_role: 
         # Use session_id as document ID for easy lookup
         doc_ref = db.collection(PROVISIONING_REQUESTS_COLLECTION).document(session_id)
         doc_ref.set(request_data)
-
         logging.info(f"Persisted provisioning request to Firestore: {session_id}")
-        return doc_ref
     except Exception as e:
         logging.error(f"Failed to persist provisioning request: {e}")
         raise
@@ -262,25 +325,177 @@ def update_provisioning_request_status(session_id: str, status: str, result_data
 
         if result_data:
             update_data["result"] = result_data
-
         doc_ref.update(update_data)
         logging.info(f"Updated provisioning request status: {session_id} -> {status}")
     except Exception as e:
         logging.error(f"Failed to update provisioning request status: {e}")
         raise
 
-# --- 5. CREATE HTTP SERVER WITH SESSION ENDPOINTS ---
+# --- 5. ROUTE HANDLERS ---
 
-async def start_provisioning_endpoint(request):
-    """HTTP endpoint to initiate IAM provisioning"""
-    data = await request.json()
-    session_id = data.get("session_id")
-    user_id = data.get("user_id")
-    requested_role = data.get("requested_role")
-    project_scope = data.get("project_scope")
-    user_timezone = data.get("user_timezone", 'UTC')
+async def dashboard_handler(request: Request):
+    """Serves the UI."""
+    return HTMLResponse(DASHBOARD_HTML)
 
-    persist_provisioning_request(session_id, user_id, requested_role, project_scope, "INITIATED")
+async def status_dashboard_handler(request: Request):
+    """
+    Renders the Live Status Dashboard by querying Firestore.
+    """
+    # Query last 20 requests, sorted by time
+    try:
+        docs = db.collection(PROVISIONING_REQUESTS_COLLECTION)\
+                 .order_by("timestamp", direction=firestore.Query.DESCENDING)\
+                 .limit(20)\
+                 .stream()
+        
+        rows = ""
+        for doc in docs:
+            data = doc.to_dict()
+            status = data.get("status", "UNKNOWN")
+            
+            # Color Coding
+            bg_color = "#eee"
+            if "WAITING" in status: bg_color = "#fff3cd" # Yellow
+            elif "DONE" in status or "APPLIED" in status: bg_color = "#d4edda" # Green
+            elif "FAILED" in status or "REJECTED" in status: bg_color = "#f8d7da" # Red
+            elif "QUEUED" in status: bg_color = "#cce5ff" # Blue
+
+            rows += f"""
+            <tr style="background-color: {bg_color};">
+                <td style="padding: 10px;">{data.get('timestamp').strftime('%H:%M:%S') if data.get('timestamp') else 'N/A'}</td>
+                <td style="padding: 10px;">{data.get('user_id')}</td>
+                <td style="padding: 10px;">{data.get('requested_role')}</td>
+                <td style="padding: 10px;"><strong>{status}</strong></td>
+                <td style="padding: 10px; font-family: monospace; font-size: 0.8em;">{data.get('session_id')[:8]}...</td>
+            </tr>
+            """
+            
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Live Status | Zero-Touch IAM</title>
+            <meta http-equiv="refresh" content="5"> <!-- Auto Refresh every 5s -->
+            <style>
+                body {{ font-family: 'Segoe UI', sans-serif; background-color: #f4f6f8; padding: 40px; }}
+                .container {{ max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+                th {{ text-align: left; padding: 12px; background-color: #1a73e8; color: white; }}
+                tr {{ border-bottom: 1px solid #ddd; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                {NAV_BAR}
+                <h2>Live Operations Center</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time (UTC)</th>
+                            <th>User</th>
+                            <th>Role Requested</th>
+                            <th>Current Status</th>
+                            <th>Session ID</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows}
+                    </tbody>
+                </table>
+                <p style="text-align: center; color: #666; margin-top: 20px;">Auto-refreshing every 5 seconds...</p>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(html)
+    except Exception as e:
+        return HTMLResponse(f"Error loading dashboard: {e}", status_code=500)
+
+async def manual_trigger_handler(request: Request):
+    """
+    Handles Form POST -> Publishes to Pub/Sub.
+    Decouples UI from Execution.
+    """
+    form_data = await request.form()
+    session_id = f"session-{uuid.uuid4()}"
+    
+    # 1. Construct Payload
+    payload = {
+        "session_id": session_id,
+        "user_id": form_data.get("user_id"),
+        "requested_role": form_data.get("requested_role"),
+        "project_scope": form_data.get("project_scope"),
+        "user_timezone": form_data.get("user_timezone", "UTC"),
+        "trigger_source": "DASHBOARD_UI"
+    }
+
+    logging.info(f"🚀 Publishing Request to Pub/Sub: {session_id}")
+    persist_provisioning_request(session_id, payload["user_id"], payload["requested_role"], payload["project_scope"], "QUEUED_PUBSUB")
+
+    try:
+        # 3. Publish Message
+        data_str = json.dumps(payload)
+        data = data_str.encode("utf-8")
+        
+        future = publisher.publish(topic_path, data)
+        message_id = future.result() # Wait for publish confirmation
+        
+        logging.info(f"✅ Published message ID: {message_id}")
+        
+        # 4. Return Success UI
+        return HTMLResponse(f"""
+            <div style="font-family: sans-serif; text-align: center; padding: 50px;">
+                <h1 style="color: green;">Request Queued Successfully ✅</h1>
+                <p><strong>Session ID:</strong> {session_id}</p>
+                <p><strong>Message ID:</strong> {message_id}</p>
+                <p>The request has been sent to the event bus. The agent will pick it up shortly.</p>
+                <hr>
+                <p><small>({SENDER_EMAIL}) will send the approval request to the approvers.</small></p>
+                <a href="/">Submit Another Request</a>
+            </div>
+        """)
+    except Exception as e:
+        logging.error(f"Pub/Sub Publish Error: {e}")
+        return HTMLResponse(f"<h1>Publish Error</h1><p>{str(e)}</p>", status_code=500)
+
+async def start_provisioning_endpoint(request: Request):
+    """
+    Handles Trigger Events.
+    UPDATED: Now supports both Direct JSON AND Pub/Sub Push envelopes.
+    """
+    try:
+        raw_body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    payload = {}
+
+    # --- Detect Pub/Sub Envelope ---
+    if "message" in raw_body and "data" in raw_body["message"]:
+        try:
+            b64_data = raw_body["message"]["data"]
+            decoded_str = base64.b64decode(b64_data).decode("utf-8")
+            payload = json.loads(decoded_str)
+            logging.info("📩 Consumed Pub/Sub Event for Session: {payload.get('session_id')}")
+        except Exception as e:
+            logging.error(f"Pub/Sub decode failed: {e}")
+            return JSONResponse({"error": "Bad Pub/Sub Payload"}, status_code=400)
+    else:
+        # Direct JSON (CLI/Postman)
+        payload = raw_body
+
+    # Extract & Validate
+    session_id = payload.get("session_id", f"auto-{uuid.uuid4()}")
+    user_id = payload.get("user_id")
+    requested_role = payload.get("requested_role")
+    project_scope = payload.get("project_scope")
+    user_timezone = payload.get("user_timezone", 'UTC')
+
+    if not all([user_id, requested_role, project_scope]):
+        return JSONResponse({"error": "Missing required fields"}, status_code=400)
+
+    # Update status to PROCESSING (it was QUEUED before)
+    update_provisioning_request_status(session_id, "PROCESSING_AGENT_STARTED")
 
     try:
         result = await orchestrator_agent.start_provisioning(
@@ -293,14 +508,16 @@ async def start_provisioning_endpoint(request):
         logging.error(f"Error: {e}")
         update_provisioning_request_status(session_id, "FAILED", {"error": str(e)})
         return JSONResponse({"status": "ERROR", "error": str(e)}, status_code=500)
+    
 
-async def process_approval_webhook(request):
+async def process_approval_webhook(request: Request):
     """
     Handles the click from the email.
     Generates synthetic text to feed the NLU Agent.
     """
     session_id = request.query_params.get('session_id')
     action = request.query_params.get('action') # APPROVED or DENIED
+    approver_email = request.query_params.get('approver_email', SENDER_EMAIL)
     
     if not session_id or not action:
         return HTMLResponse("<h1>Error: Invalid Link</h1>", status_code=400)
@@ -309,15 +526,11 @@ async def process_approval_webhook(request):
     update_provisioning_request_status(session_id, f"HUMAN_CLICKED_{action}")
 
     # --- GENERATE SYNTHETIC TEXT FOR NLU ---
-    # In a future version, this could come from a HTML text box.
+    # In a future version, this could come from a HTML text box or reply email body.
     if action == "APPROVED":
         simulated_text = "I have reviewed the policy justification and I explicitly APPROVE this access request."
     else:
         simulated_text = "I am REJECTING this request because it violates our internal freeze period."
-    
-    # We assume the approver is the Admin (simplified for prototype)
-    # In prod, we'd verify the token to know exactly who clicked it.
-    approver_identity = SENDER_EMAIL 
 
     # Execute the provisioning workflow
     try:
@@ -325,10 +538,11 @@ async def process_approval_webhook(request):
         result = await orchestrator_agent.resume_with_approval(
             session_id=session_id,
             raw_response_text=simulated_text, 
-            approver_email=approver_identity
+            approver_email=approver_email
         )
         
-        status = result.get('status')
+        status = result.get('status', 'UNKOWN')
+        update_provisioning_request_status(session_id, status)
         color = "green" if "APPLIED" in str(status) else "red"
         audit_summary = result.get('audit_summary', 'Audit summary not available.').replace('\n', '<br>')
         
@@ -346,6 +560,7 @@ async def process_approval_webhook(request):
                     {audit_summary}
                 </div>
                 <p>You can close this window.</p>
+                <a href="{APPROVAL_CALLBACK_URL.replace('/respond', '/status')}">Back to Dashboard</a>
             </body>
         </html>
         """
@@ -354,12 +569,22 @@ async def process_approval_webhook(request):
     except Exception as e:
         logging.error(f"Webhook Error: {e}")
         return HTMLResponse(f"<h1>System Error</h1><p>{e}</p>", status_code=500)
+    
+async def emergency_stop_handler(request: Request):
+    """Emergency Kill Switch."""
+    logging.critical("🚨 EMERGENCY STOP TRIGGERED 🚨")
+    # In production, this would Iterate active sessions -> Cancel them -> Call Provisioner to revoke JIT tokens
+    return JSONResponse({"status": "SYSTEM_SUSPENDED", "action": "Revocation Queued"})
 
 # Create Starlette app with routes
 app = Starlette(
     routes=[
-        Route('/start_provisioning', start_provisioning_endpoint, methods=['POST']),
+        Route('/', dashboard_handler, methods=['GET']),  # Dashboard
+        Route('/status', status_dashboard_handler, methods=['GET']), # Status
+        Route('/manual_trigger', manual_trigger_handler, methods=['POST']), # Form Handler
+        Route('/start_provisioning', start_provisioning_endpoint, methods=['POST']), # Updated Trigger
         Route('/respond', process_approval_webhook, methods=['GET']),
+        Route('/emergency-stop', emergency_stop_handler, methods=['POST']), # Safety
     ]
 )
 

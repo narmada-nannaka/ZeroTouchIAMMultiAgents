@@ -24,3 +24,13 @@ gcloud projects add-iam-policy-binding ${PROJECT_ID} \
 gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="serviceAccount:${PROVISIONER_SA}" \
     --role="roles/logging.logWriter"
+
+#Grant Orchestrator access to publish to iam-request-topic
+gcloud pubsub topics add-iam-policy-binding iam-request-topic --member="${ORCHESTRATOR_SA}" --role="roles/pubsub.publisher"
+
+#Create subscription to the iam-request-topic and grant access to Pub/Sub Invoker
+gcloud pubsub subscriptions create iam-request-sub --topic iam-request-topic --push-endpoint=${ORCHESTRATOR SERVICE URL}/start_provisioning --push-auth-service-account=${Pub/Sub Invoker for IAM Orchestrator}
+
+#Grant Pub/Sub Invoker to invoke orchestrator service
+gcloud run services add-iam-policy-binding iam-orchestrator-service --region asia-southeast1 --member="${Pub/Sub Invoker for IAM Orchestrator}" --role="roles/run.invoker"
+
