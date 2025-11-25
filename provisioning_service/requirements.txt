@@ -1,5 +1,6 @@
 # provisioning_service/requirements.txt
 google-adk[a2a]
 google-cloud-firestore
+google-cloud-resource-manager
 uvicorn[standard]
 starlette

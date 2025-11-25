@@ -3,6 +3,9 @@
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
 from typing import Dict, Any, Optional
+from google.cloud import resourcemanager_v3
+from google.iam.v1 import policy_pb2
+from google.type import expr_pb2
 import logging
 import random
 import datetime
@@ -81,43 +84,84 @@ class IAMProvisioningAgent(LlmAgent):
     # The most sensitive tool: Executes policy change
     def _perform_iam_set(self, requested_role: str, user_id: str, justification: str, project_id: str) -> Dict[str, Any]:
         """
-        Simulates the JIT elevation and the immutable policy application.
+        Applies a real, conditional, time-bound IAM policy binding.
         Returns a strictly shaped dictionary to ensure Pydantic response validation passes.
         """
-        logger.info(f"EXECUTION: Initiating JIT access request for {user_id} in {project_id}...")
+        logger.info("EXECUTION: JIT elevation successful (simulated). Proceeding with IAM policy update.")
         
-        timestamp = datetime.datetime.now().isoformat()
+        timestamp = datetime.datetime.now(datetime.timezone.utc)
 
-        # --- JIT SIMULATION ---
-        if random.random() < 0.05: 
-            logger.error("EXECUTION: PAM JIT request failed.")
-            # ARCHITECTURAL FIX: Unified response schema for failure path.
-            # Returning the same keys (even as None) prevents Pydantic validation errors 
-            # if it inferred a strict schema from the success path.
+        try:
+            # --- REAL IAM EXECUTION ---
+            client = resourcemanager_v3.ProjectsClient()
+
+            primitive_roles = {"roles/viewer", "roles/editor", "roles/owner"}
+            resource = f"projects/{project_id}"
+            
+            # 1. Get the current IAM policy for the project
+            current_policy = client.get_iam_policy(request={"resource": resource})
+
+            if requested_role in primitive_roles:
+                # No condition allowed; version can stay as-is
+                current_policy.bindings.append(
+                    policy_pb2.Binding(
+                        role=requested_role,
+                        members=[f"user:{user_id}"],
+                    )
+                )
+                reason_text = f"Access granted (no condition allowed on primitive roles)"
+                 
+            else:
+                current_policy.version = 3
+                # 2. Define the temporal condition for the new binding
+                expiration_time = timestamp + datetime.timedelta(hours=1) # Grant access for 1 hour
+                condition = expr_pb2.Expr(
+                    title=f"jit_access_{timestamp.strftime('%Y%m%d%H%M')}",
+                    description=f"JIT access for {user_id} until {expiration_time.isoformat()}. Justification: {justification}",
+                    expression=f'request.time < timestamp("{expiration_time.isoformat()}")'
+                )
+                # 3. Add the new conditional binding to the policy
+                current_policy.bindings.append(
+                    policy_pb2.Binding(
+                        role=requested_role,
+                        members=[f"user:{user_id}"],
+                        condition=condition,
+                    )
+                )
+                reason_text = f"Access granted until {expiration_time.isoformat()}"
+
+            # 4. Set the updated policy
+            client.set_iam_policy(
+                request={
+                    "resource": resource,
+                    "policy": current_policy,
+                }
+            )
+            
+            logger.info(f"EXECUTION: IAM policy change successfully applied for {requested_role}.")
+            
+            return IAMProvisioningResponse(
+                    status="POLICY_APPLIED",
+                    timestamp=timestamp.isoformat(),
+                    reason=reason_text,
+                    applied_policy=PolicyDetails(
+                        role=requested_role,
+                        member=f"user:{user_id}",
+                        resource=f"projects/{project_id}"
+                    ),
+                    audit_trail=AuditTrail(
+                        jit_token_id=f"jit-{random.randint(1000,9999)}",
+                        justification=justification,
+                        audit_data=f"See Cloud Audit Logs for project {project_id} around {timestamp.isoformat()}"
+                    )
+                )
+
+        except Exception as e:
+            logger.error(f"EXECUTION: IAM policy update failed: {e}", exc_info=True)
             return IAMProvisioningResponse(
                     status="EXECUTION_FAILURE",
-                    timestamp=timestamp,
-                    reason="PAM rejected temporary elevation request.",
+                    timestamp=timestamp.isoformat(),
+                    reason=f"Failed to apply IAM policy: {str(e)}",
                     applied_policy=None,
                     audit_trail=None
                 )
-        
-        # --- EXECUTION SIMULATION ---
-        logger.info(f"EXECUTION: Policy change successfully applied for {requested_role}.")
-        
-        # ARCHITECTURAL FIX: Unified response schema for success path.
-        return IAMProvisioningResponse(
-                status="POLICY_APPLIED",
-                timestamp=timestamp,
-                reason=None,
-                applied_policy=PolicyDetails(
-                    role=requested_role,
-                    member=f"user:{user_id}",
-                    resource=f"projects/{project_id}" # Use the provided scope
-                ),
-                audit_trail=AuditTrail(
-                    jit_token_id=f"jit-{random.randint(1000,9999)}",
-                    justification=justification,
-                    audit_data=f"GCP Cloud Audit log correlation link for {timestamp}"
-                )
-            )

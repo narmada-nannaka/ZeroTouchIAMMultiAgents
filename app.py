@@ -330,14 +330,21 @@ async def process_approval_webhook(request):
         
         status = result.get('status')
         color = "green" if "APPLIED" in str(status) else "red"
+        audit_summary = result.get('audit_summary', 'Audit summary not available.').replace('\n', '<br>')
         
         html_content = f"""
         <html>
+            <head>
+                <title>IAM Provisioning Decision</title>
+            </head>
             <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                 <h1 style="color: {color};">Decision Processed</h1>
                 <p>The NLU Agent has analyzed your input.</p>
                 <p><strong>Input:</strong> "{simulated_text}"</p>
                 <p><strong>NLU Classification:</strong> {status}</p>
+                <div style="text-align: left; background-color: #f2f2f2; padding: 20px: border-radius: 8px; margin-top: 30px; font-family: monospace; white-space: pre-wrap;">
+                    {audit_summary}
+                </div>
                 <p>You can close this window.</p>
             </body>
         </html>

@@ -472,16 +472,24 @@ class IAMOrchestrator(LlmAgent):
         else:
             policy_binding = "N/A"
 
+        # Add a clear final outcome line
+        final_status = execution.get('status', 'FAILED')
+        if final_status == "POLICY_APPLIED":
+            outcome_line = f"FINAL OUTCOME: SUCCESS. {execution.get('reason', 'Policy was applied.')}"
+        else:
+            outcome_line = f"FINAL OUTCOME: FAILURE. Reason: {execution.get('reason', 'An unknown error occurred.')}"
+
         # This function synthesizes the entire decision process for compliance officers.
         summary = [
             f"--- AUDIT TRACE: SESSION {session_id} ---",
             f"IAM REQUEST: Assigned role {lookup.get('role_id', 'N/A')} to {lookup.get('user_id', 'N/A')} in {lookup.get('gcp_project_scope', 'N/A')}.",
             f"COMPLIANCE CHECK: Constraint: {context.get('constraint_type', 'UNKNOWN')}.",
             f"JUSTIFICATION: {context.get('justification_summary', 'N/A')}",
-            f"APPROVAL: Status: {nlu.get('status', 'UNKNOWN')}. Approver: {nlu.get('approver_id', 'UNKNOWN')}.",
+            f"APPROVAL: Status: {nlu.get('status', 'UNKNOWN')}. Approver: {nlu.get('approver_id', 'UNKNOWN')}. Summary: {nlu.get('reason_summary', 'N/A')}",
             f"EXECUTION STATUS: {execution.get('status', 'FAILED')}.",
             f"JIT ACCESS: {jit_info}.",
             f"IAM POLICY APPLIED: {policy_binding}",
-            f"--- END OF TRACE ---"
+            f"{outcome_line}",
+            f"--- END OF TRACE ---",
         ]
         return "\n".join(summary)
