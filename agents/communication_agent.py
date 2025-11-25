@@ -7,7 +7,6 @@ import os
 import traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from textwrap import dedent
 from typing import Dict, List, Optional
 
 # Imports for Enterprise Auth
@@ -54,12 +53,6 @@ class CommunicationAgent:
                 
                 self._gmail_service = build("gmail", "v1", credentials=delegated_creds, cache_discovery=False)
                 logging.info(f"COMM AGENT: Successfully authorized as {sender_email} via Domain-Wide Delegation.")
-
-            # 2. Legacy/Personal Fallback (token.json)
-            elif os.path.exists("token.json"):
-                logging.info("COMM AGENT: Found 'token.json'. Using Personal Gmail OAuth Flow.")
-                creds = Credentials.from_authorized_user_file("token.json", scopes=[self.GMAIL_SCOPE])
-                self._gmail_service = build("gmail", "v1", credentials=creds, cache_discovery=False)
 
             else:
                 raise FileNotFoundError(f"No credential file found. Checked '{sa_key_path}' and 'token.json'.")

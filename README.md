@@ -11,11 +11,11 @@ This project implements an **autonomous IAM provisioning orchestration system** 
 - **Multi-agent AI orchestration** using Google ADK
 - **Agent-to-Agent (A2A) security isolation** for privileged operations
 - **Policy-aware decision making** with RAG (Retrieval Augmented Generation)
+- **Approval email decisions** with Gmail API (OAuth Authentication) 
 - **Natural Language Understanding** for email-based approval classification
 - **Temporal compliance guardrails** for time-restricted access
-- **Comprehensive audit trails** for regulatory compliance
-
-Real IAM mutations, PAM/JIT elevation, and inbound email ingestion are currently simulated so the orchestration loop can be exercised safely.
+- **IAM Policy Application** with Google Cloud Resource Manager
+- **Comprehensive audit trails** for regulatory compliance (Firestore)
 
 ### Key Innovation
 
@@ -28,32 +28,34 @@ The system demonstrates **Zero-Touch IAM Provisioning** - where access requests 
 ### High-Level Design
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    ORCHESTRATOR SERVICE                         │
-│                    (Cloud Run - Low Privilege)                  │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │          IAMOrchestrator (Main Agent)                    │  │
-│  │                                                          │  │
-│  │  Sub-Agents:                                            │  │
-│  │  ├─ ApproverLookupAgent (Firestore)                    │  │
-│  │  ├─ PolicyContextAgent (RAG + Compliance)              │  │
-│  │  ├─ NLUClassifierAgent (Gemini)                        │  │
-│  │  └─ RemoteA2aAgent (Provisioning Client)              │  │
-│  └─────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    ORCHESTRATOR SERVICE                      │
+│                    (Cloud Run - Low Privilege)               │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │          IAMOrchestrator (Main Agent)                  │ │
+│  │                                                        │ │
+│  │  Sub-Agents:                                          │ │
+│  │  ├─ ApproverLookupAgent (Firestore)                   │ │
+│  │  ├─ PolicyContextAgent (RAG + Compliance)             │ │
+│  │  ├─ CommunicationAgent (Gmail API)                    │ │
+│  │  ├─ NLUClassifierAgent (Gemini)                       │ │
+│  │  └─ RemoteA2aAgent (Provisioning Client)              │ │
+│  └────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
                               │
-                              │ A2A Protocol (Isolated Communication)
+                              ├─ Gmail API (Real Email)
+                              │  └─ HTML Email with Buttons
+                              │     ├─ APPROVE → /respond?action=APPROVED
+                              │     └─ DENY → /respond?action=DENIED
+                              │
+                              ├─ A2A Protocol (Isolated Communication)
                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│               PROVISIONING SERVICE                              │
-│               (Cloud Run - High Privilege + JIT)                │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │     IAMProvisioningAgent                                 │  │
-│  │     └─ execute_iam_set_tool (IAM API + PAM)            │  │
-│  └─────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│               PROVISIONING SERVICE                           │
+│               (Cloud Run - High Privilege + JIT)             │
+└─────────────────────────────────────────────────────────────┘
+
 ```
 
 ### Architecture Principles
@@ -86,10 +88,27 @@ The system demonstrates **Zero-Touch IAM Provisioning** - where access requests 
 - `GCP_LOCATION`: Region for Vertex AI services (default: global)
 - `RAG_ENGINE_ID`: Vertex AI Search engine ID
 - `RAG_DATA_STORE_ID`: Data store ID for policy documents
-- `SENDER_EMAIL`: Gmail address for sending approval emails (optional)
-- `APPROVAL_CALLBACK_URL`: URL for manual approval callback (optional)
-- `GMAIL_TOKEN_PATH`: Path to Gmail OAuth token file (default: token.json)
+- `SENDER_EMAIL`: Gmail address for sending approval emails (required for real email)
+- `SA_KEY_PATH`: Path to service account key file (default: orchestrator_key.json)
+- `APPROVAL_CALLBACK_URL`: Public URL for email callback handling (e.g., https://your-service.run.app)
 - `PORT`: HTTP server port (default: 8080)
+- `HOST`: Server host (default: 0.0.0.0)
+
+**HTTP Endpoints**:
+
+| Endpoint | Method | Purpose | Parameters |
+|----------|--------|---------|------------|
+| `/start_provisioning` | POST | Initiate access request | session_id, user_id, requested_role, project_scope, user_timezone |
+| `/respond` | GET | Process email approval clicks | session_id (query), action (query: APPROVED/DENIED) |
+
+**Endpoint Details**:
+
+#### `/respond` (Email Callback Handler)
+- Processes approval/denial clicks from email buttons
+- Generates synthetic NLU input based on action
+- Resumes orchestrator workflow with `resume_with_approval()`
+- Returns HTML success/error page to user's browser
+- Updates `provisioning-requests` collection with decision
 
 ### 2. IAM Orchestrator Agent (`agents/orchestrator.py`)
 
@@ -197,52 +216,34 @@ c) **Temporal Compliance Check** (`_check_temporal_compliance`) - ✅ **FULLY IM
 
 **Purpose**: ✅ **FULLY IMPLEMENTED** - Sends approval request emails via Gmail API
 
-**Authentication Methods**:
-1. **OAuth User Credentials** (Personal Gmail):
-   - Reads from `token.json` file (generated via `generate_gmail_token.py`)
-   - Supports personal @gmail.com accounts
-   - Includes refresh token for long-term operation
-
-2. **Default Credentials** (Enterprise):
-   - Fallback to service account credentials
-   - For Google Workspace domains
+**Primary Authentication Method**:
+**Service Account with Domain-Wide Delegation** (Enterprise - RECOMMENDED):
+   - Uses `SA_KEY_PATH` environment variable (default: `orchestrator_key.json`)
+   - Impersonates user specified in `SENDER_EMAIL` via `with_subject()`
+   - Requires Workspace Admin to enable Domain-Wide Delegation
+   - Production-ready for enterprise environments
 
 **Key Features**:
 - ✅ Real Gmail API integration using `google-api-python-client`
 - ✅ Async email sending with asyncio thread pool executor
-- ✅ Automatic fallback to simulation mode if credentials missing
 - ✅ Structured email templates with justification context
 - ✅ Returns message metadata (message_id, thread_id) for tracking
 
-**Input Parameters**:
-- `session_id`: Request correlation ID
-- `requester_email`: User requesting access
-- `requested_role`: IAM role being requested
-- `project_scope`: Target GCP project
-- `approvers`: List of approver email addresses
-- `justification`: Policy context for approval decision
-
-**Output**:
-```python
-{
-  "message_id": "gmail-message-id",
-  "thread_id": "gmail-thread-id",
-  "provider": "gmail" | "simulated"
-}
-```
-
 **Email Template Structure**:
 - Subject: `[ACTION REQUIRED] Access request for {requester_email}`
-- Body includes: session ID, requested role, project scope, justification text
-- Instructions for approvers to reply with APPROVED/DENIED
-- Optional callback URL for web-based approval
+- Body includes:
+  - Session ID for tracking
+  - Requested role and project scope
+  - AI-generated policy justification in highlighted box
+  - **Interactive Buttons**: Clickable APPROVE/DENY links (not reply-based)
+- Callback URLs: `/respond?session_id={id}&action=APPROVED|DENIED`
 
-**Error Handling**:
-- Graceful fallback to simulation mode if:
-  - `SENDER_EMAIL` not configured
-  - Gmail API client initialization fails
-  - OAuth token missing or expired
-- All errors logged with detailed context for troubleshooting
+**Configuration**:
+- `SENDER_EMAIL`: Gmail address for sending emails (required)
+- `SA_KEY_PATH`: Path to service account key (default: orchestrator_key.json)
+- `APPROVAL_CALLBACK_URL`: Base URL for approval callbacks
+
+
 
 ### 7. IAM Provisioning Agent (`provisioning_service/provisioning_agent.py`)
 
@@ -389,7 +390,6 @@ class IAMProvisioningResponse(BaseModel):
 ### Communication & Authentication
 - **google-api-python-client**: Gmail API client
 - **google-auth**: GCP authentication
-- **google-auth-oauthlib**: OAuth flows for personal Gmail
 - **google-auth-httplib2**: HTTP transport for Gmail API
 
 ### Utilities
@@ -448,13 +448,23 @@ class IAMProvisioningResponse(BaseModel):
    ✓ Current time: 10:30 AM PST, Wednesday
    ✓ PASS: Within business hours (Mon-Fri, 08:00-17:00)
 
-5. Email Simulation (Mocked)
-   → Simulate approval email sent
+5. Email Communication
+   ✅ REAL Gmail API call if configured
+   → Sends HTML email to manager@example.com
+   → Email contains:
+      - AI-generated justification from RAG
+      - Clickable APPROVE button → /respond?session_id=session-123&action=APPROVED
+      - Clickable DENY button → /respond?session_id=session-123&action=DENIED
 
-6. Response Simulation
-   email_body = "Yes, please approve this request."
+6. Human Interaction
+   → Approver clicks APPROVE button in email
+   → Browser redirects to: /respond?session_id=session-123&action=APPROVED
+   → Webhook handler processes click
 
 7. NLU Classification
+   Synthetic text generated from button click:
+   email_body = "I have reviewed the policy justification and I explicitly APPROVE this access request."
+   
    Gemini 2.5 Flash → Structured JSON
    {
      "status": "APPROVED",
@@ -498,64 +508,28 @@ class IAMProvisioningResponse(BaseModel):
 - **NLU classification**: ✅ **REAL** Gemini 2.5 Flash via Vertex AI SDK with structured output
 - **Communication Agent**: ✅ **FULLY IMPLEMENTED** Gmail API integration with OAuth2 support
 - **Service Account Authentication**: ✅ **FULLY IMPLEMENTED** ID token validation middleware
+- **IAM Policy Provisioning**: ✅ **FULLY IMPLEMENTED** Real `setIamPolicy` calls with:
+  - Conditional time-bound access (1 hour expiration)
+  - Support for both primitive and custom roles
+  - Proper IAM policy version handling (v3 for conditions)
+  - Error handling and audit trail generation
 - **Structured audit trails**: Comprehensive logging and narrative generation
 - **Docker containerization**: Ready for Cloud Run deployment
 - **Custom IAM roles**: Least-privilege security model defined
-- **Gmail OAuth Token Generation**: Utility script (`generate_gmail_token.py`) for personal Gmail
 
-### ⚠️ Simulated Components (Working, but not calling real APIs)
+### ⚠️ Development/Testing Features
 
-- **IAM Provisioning**: Simulated execution (production: real IAM API calls via `setIamPolicy`)
-- **JIT Elevation**: Simulated PAM integration with 5% failure rate (production: requires PAM system)
-- **Approval Response Collection**: Hardcoded simulation (production: Pub/Sub email webhook)
+- **JIT Elevation Simulation**: Currently logs "JIT elevation successful (simulated)" 
+  - In production, this would integrate with a real PAM (Privileged Access Management) system
+  - IAM execution itself is fully functional - only the JIT "approval" step is simulated
+  - The actual policy changes ARE applied to real GCP resources
 
 ### ❌ Not Yet Implemented
 
 - **Pub/Sub Integration**: Async event handling for inbound email responses
-- **Email Response Webhook**: Automatic parsing of approval email replies
 - **Emergency Stop Mechanism**: Security kill switch endpoint
-- **Production Error Handling**: Comprehensive retry and recovery logic for IAM API failures
-- **Real IAM API Calls**: Actual `resourcemanager.projects.setIamPolicy` invocation
-
----
-
-## Testing & Simulation
-
-### Local Simulation
-
-The system includes a simulation mode for testing:
-
-**File**: `simulate_local_main.py` (if present)
-
-**Simulated Components**:
-1. **Email Communication**: Hardcoded approval response instead of actual email
-2. **JIT Elevation**: Random success (95%) without real PAM
-3. **IAM API**: No actual policy changes, returns mock success
-
-**Test Scenario**:
-```python
-# Simulated approver response
-simulated_response_text = "Yes, please approve this request."
-# Alternative: "I'm travelling this week, so I'll review this next Monday."
-```
-
-### Running Tests
-
-```bash
-# Start the orchestrator service
-python app.py
-
-# Make a test request
-curl -X POST http://localhost:8080/start_provisioning \
-  -H "Content-Type: application/json" \
-  -d '{
-    "session_id": "test-session-1",
-    "user_id": "dev@example.com",
-    "requested_role": "roles/viewer",
-    "project_scope": "test-project",
-    "user_timezone": "UTC"
-  }'
-```
+- **Rate Limiting**: Request throttling and abuse detection
+- **Advanced Error Recovery**: Comprehensive retry logic for transient failures
 
 ---
 
@@ -581,6 +555,18 @@ curl -X POST http://localhost:8080/start_provisioning \
 4. Service Accounts:
    - Orchestrator SA (low privilege)
    - Provisioner SA (high privilege with custom role)
+
+5. Gmail Configuration:
+   Create service account in GCP Console
+   - Download service account key → save as `orchestrator_key.json`
+   - In Google Workspace Admin Console:
+      - Security > API Controls > Domain-Wide Delegation
+      - Add Client ID with scope: `https://www.googleapis.com/auth/gmail.send`
+   - Set environment variables:
+```bash
+      export SENDER_EMAIL="bot@your-domain.com"
+      export SA_KEY_PATH="orchestrator_key.json"
+```
 
 ### Deployment Steps
 

@@ -5,7 +5,6 @@ google-cloud-aiplatform # Required for NLU and RAG agents
 uvicorn[standard]       # Standard server
 starlette               # Lightweight framework for ADK service wrapper
 google-auth
-google-auth-oauthlib
 google-cloud-run
 google-cloud-discoveryengine
 pytz
