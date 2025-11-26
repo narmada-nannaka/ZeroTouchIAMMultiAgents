@@ -5,13 +5,14 @@ import base64
 import logging
 import os
 import traceback
+import jwt
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Dict, List, Optional
 
 # Imports for Enterprise Auth
 from google.oauth2 import service_account
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -27,9 +28,7 @@ class CommunicationAgent:
         self._gmail_service = None
         self._init_error = None
 
-        if not sender_email:
-            logging.warning("COMM AGENT: sender email not configured; emails will be logged only.")
-            return
+        self.jwt_secret = os.environ.get("JWT_SECRET")
 
         try:
             # --- AUTHENTICATION STRATEGY (ENTERPRISE) ---
@@ -62,6 +61,23 @@ class CommunicationAgent:
             logging.error(f"COMM AGENT: Failed to initialize Gmail API client: {exc}")
             self._gmail_service = None
 
+    def _generate_secure_link(self, base_url, session_id, action, approver_email):
+        """Generates a signed JWT link."""
+        if not self.jwt_secret:
+            # Fallback for when secret is missing (Prototype compatibility)
+            return f"{base_url}/respond?session_id={session_id}&action={action}&approver_email={approver_email}"
+        
+        payload = {
+            "sid": session_id,
+            "act": action,
+            "sub": approver_email,
+            "iat": datetime.now(timezone.utc),
+            "exp": datetime.now(timezone.utc) + timedelta(days=7) # Link valid for 7 days
+        }
+        
+        token = jwt.encode(payload, self.jwt_secret, algorithm="HS256")
+        return f"{base_url}/respond?token={token}"
+
     async def send_approval_email(
         self,
         *,
@@ -82,8 +98,6 @@ class CommunicationAgent:
         # ...
         # Construct the Links
         base_url = self.approval_callback_url.rstrip('/') 
-        # We assume callback_url is like "https://service-url.run.app"
-        # The route we added in app.py is "/respond"
         
         results = []
         
@@ -92,8 +106,8 @@ class CommunicationAgent:
             
             # 1. Generate UNIQUE Links for this specific approver
             # This fixes the parameter passing issue
-            approve_link = f"{base_url}/respond?session_id={session_id}&action=APPROVED&approver_email={approver}"
-            deny_link = f"{base_url}/respond?session_id={session_id}&action=DENIED&approver_email={approver}"
+            approve_link = self._generate_secure_link(base_url, session_id, "APPROVED", approver)
+            deny_link = self._generate_secure_link(base_url, session_id, "DENIED", approver)
 
             subject = f"[ACTION REQUIRED] Access request for {requester_email}"
             # Use HTML Body for buttons
@@ -119,7 +133,8 @@ class CommunicationAgent:
                     
                     <p style="font-size: 12px; color: #5f6368; margin-top: 40px;">
                         Session ID: {session_id}<br>
-                        Zero-Touch IAM Orchestrator
+                        Zero-Touch IAM Orchestrator (AI Agent)
+                        <em>* Security links are valid for 7 days.</em>
                     </p>
                 </body>
             </html>
@@ -132,7 +147,7 @@ class CommunicationAgent:
                 "session_id": session_id,
             }
 
-            # --- 2. SIMULATION MODE CHECK (Your requested feature) ---
+            # --- 2. SIMULATION MODE CHECK  ---
             if not self.sender_email or not self._gmail_service:
                 logging.warning(f"⚠️ [SIMULATION] Sending to {approver}")
                 logging.warning(f"🔗 CLICK TO APPROVE: {approve_link}")

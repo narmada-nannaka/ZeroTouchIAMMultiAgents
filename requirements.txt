@@ -11,3 +11,4 @@ pytz
 google-api-python-client
 google-auth-httplib2
 google-cloud-pubsub
+pyjwt==2.9.0

@@ -34,3 +34,7 @@ gcloud pubsub subscriptions create iam-request-sub --topic iam-request-topic --p
 #Grant Pub/Sub Invoker to invoke orchestrator service
 gcloud run services add-iam-policy-binding iam-orchestrator-service --region asia-southeast1 --member="${Pub/Sub Invoker for IAM Orchestrator}" --role="roles/run.invoker"
 
+gcloud secrets create iam-jwt-secret --replication-policy="automatic"
+
+echo -n "SUPER_SECRET_KEY_CHANGE_THIS" | \
+    gcloud secrets versions add iam-jwt-secret --data-file=-

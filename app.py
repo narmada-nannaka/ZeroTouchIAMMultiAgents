@@ -4,6 +4,7 @@ import os
 import logging
 import datetime
 import base64, json, uuid
+import jwt
 from google.cloud import firestore
 from google.cloud import pubsub_v1
 from starlette.applications import Starlette
@@ -341,11 +342,11 @@ async def status_dashboard_handler(request: Request):
     """
     Renders the Live Status Dashboard by querying Firestore.
     """
-    # Query last 20 requests, sorted by time
+    # Query last 25 requests, sorted by time
     try:
         docs = db.collection(PROVISIONING_REQUESTS_COLLECTION)\
                  .order_by("timestamp", direction=firestore.Query.DESCENDING)\
-                 .limit(20)\
+                 .limit(25)\
                  .stream()
         
         rows = ""
@@ -353,20 +354,21 @@ async def status_dashboard_handler(request: Request):
             data = doc.to_dict()
             status = data.get("status", "UNKNOWN")
             
-            # Color Coding
-            bg_color = "#eee"
-            if "WAITING" in status: bg_color = "#fff3cd" # Yellow
-            elif "DONE" in status or "APPLIED" in status: bg_color = "#d4edda" # Green
-            elif "FAILED" in status or "REJECTED" in status: bg_color = "#f8d7da" # Red
-            elif "QUEUED" in status: bg_color = "#cce5ff" # Blue
+             # Badge Color Logic
+            badge_class = "status-unknown"
+            if "WAITING" in status: badge_class = "status-waiting"
+            elif "DONE" in status or "APPLIED" in status or "APPROVED" in status: badge_class = "status-success"
+            elif "FAILED" in status or "REJECTED" in status: badge_class = "status-failed"
+            elif "QUEUED" in status or "PROCESSING" in status: badge_class = "status-queued"
 
             rows += f"""
-            <tr style="background-color: {bg_color};">
-                <td style="padding: 10px;">{data.get('timestamp').strftime('%H:%M:%S') if data.get('timestamp') else 'N/A'}</td>
-                <td style="padding: 10px;">{data.get('user_id')}</td>
-                <td style="padding: 10px;">{data.get('requested_role')}</td>
-                <td style="padding: 10px;"><strong>{status}</strong></td>
-                <td style="padding: 10px; font-family: monospace; font-size: 0.8em;">{data.get('session_id')[:8]}...</td>
+            <tr>
+                <td style="font-family: monospace; color: #5f6368; font-weight: 500;">...{data.get('session_id')[-6:]}</td>
+                <td>{data.get('timestamp').strftime('%H:%M:%S') if data.get('timestamp') else 'N/A'}</td>
+                <td>{data.get('user_id')}</td>
+                <td>{data.get('requested_role')}</td>
+                <td>{data.get('project_scope', 'N/A')}</td>
+                <td><span class="status-badge {badge_class}">{status}</span></td>
             </tr>
             """
             
@@ -375,34 +377,58 @@ async def status_dashboard_handler(request: Request):
         <html>
         <head>
             <title>Live Status | Zero-Touch IAM</title>
-            <meta http-equiv="refresh" content="5"> <!-- Auto Refresh every 5s -->
+            <meta http-equiv="refresh" content="5"> 
             <style>
-                body {{ font-family: 'Segoe UI', sans-serif; background-color: #f4f6f8; padding: 40px; }}
-                .container {{ max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
-                table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-                th {{ text-align: left; padding: 12px; background-color: #1a73e8; color: white; }}
-                tr {{ border-bottom: 1px solid #ddd; }}
+                body {{ font-family: 'Segoe UI', sans-serif; background-color: #f8f9fa; padding: 40px; }}
+                /* Increased Width for better layout */
+                .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 25px rgba(0,0,0,0.05); }}
+                
+                table {{ width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 25px; }}
+                th {{ text-align: left; padding: 15px; border-bottom: 2px solid #eee; color: #5f6368; font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.5px; }}
+                td {{ padding: 15px; border-bottom: 1px solid #f0f0f0; font-size: 0.95em; }}
+                tr:last-child td {{ border-bottom: none; }}
+                
+                /* Badge Styles */
+                .status-badge {{
+                    padding: 6px 12px;
+                    border-radius: 20px;
+                    font-weight: 700;
+                    font-size: 0.75em;
+                    text-transform: uppercase;
+                    display: inline-block;
+                }}
+                .status-success {{ background-color: #e6f4ea; color: #1e8e3e; }}
+                .status-waiting {{ background-color: #fef7e0; color: #b06000; }}
+                .status-failed  {{ background-color: #fce8e6; color: #c5221f; }}
+                .status-queued  {{ background-color: #e8f0fe; color: #1967d2; }}
+                .status-unknown {{ background-color: #f1f3f4; color: #3c4043; }}
+                
+                h2 {{ color: #202124; margin-bottom: 10px; }}
             </style>
         </head>
         <body>
             <div class="container">
                 {NAV_BAR}
-                <h2>Live Operations Center</h2>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <h2>Live Operations Center</h2>
+                    <span style="font-size: 0.8em; color: #9aa0a6;">Auto-refresh: 5s</span>
+                </div>
+                
                 <table>
                     <thead>
                         <tr>
+                            <th style="width: 100px;">Session ID</th>
                             <th>Time (UTC)</th>
                             <th>User</th>
                             <th>Role Requested</th>
+                            <th>Scope</th>
                             <th>Current Status</th>
-                            <th>Session ID</th>
                         </tr>
                     </thead>
                     <tbody>
                         {rows}
                     </tbody>
                 </table>
-                <p style="text-align: center; color: #666; margin-top: 20px;">Auto-refreshing every 5 seconds...</p>
             </div>
         </body>
         </html>
@@ -515,12 +541,36 @@ async def process_approval_webhook(request: Request):
     Handles the click from the email.
     Generates synthetic text to feed the NLU Agent.
     """
-    session_id = request.query_params.get('session_id')
-    action = request.query_params.get('action') # APPROVED or DENIED
-    approver_email = request.query_params.get('approver_email', SENDER_EMAIL)
-    
-    if not session_id or not action:
-        return HTMLResponse("<h1>Error: Invalid Link</h1>", status_code=400)
+    token = request.query_params.get('token')
+
+    session_id = None
+    action = None
+    approver_email = None
+
+    if token:
+        # --- JWT PATH ---
+        try:
+            secret = os.environ.get("JWT_SECRET")
+            if not secret:
+                return HTMLResponse("<h1>System Error</h1><p>JWT_SECRET not configured on server.</p>", status_code=500)
+            
+            # Decode & Verify
+            payload = jwt.decode(token, secret, algorithms=["HS256"])
+            
+            session_id = payload.get("sid")
+            action = payload.get("act")
+            approver_email = payload.get("sub")
+            
+            logging.info(f"🔐 JWT Verified: {action} by {approver_email}")
+            
+        except jwt.ExpiredSignatureError:
+            return HTMLResponse("<h1>Link Expired</h1><p>This approval link is no longer valid.</p>", status_code=403)
+        except jwt.InvalidTokenError as e:
+            logging.warning(f"Invalid Token Attempt: {e}")
+            return HTMLResponse("<h1>Security Check Failed</h1><p>Invalid authentication token.</p>", status_code=403)
+        
+        if not session_id or not action:
+            return HTMLResponse("<h1>Error: Invalid Link</h1>", status_code=400)
 
     logging.info(f"WEBHOOK: Received {action} for session {session_id}")
     update_provisioning_request_status(session_id, f"HUMAN_CLICKED_{action}")
