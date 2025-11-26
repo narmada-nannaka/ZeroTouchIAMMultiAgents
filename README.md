@@ -91,6 +91,9 @@ The system demonstrates **Zero-Touch IAM Provisioning** - where access requests 
 - `SENDER_EMAIL`: Gmail address for sending approval emails (required for real email)
 - `SA_KEY_PATH`: Path to service account key file (default: orchestrator_key.json)
 - `APPROVAL_CALLBACK_URL`: Public URL for email callback handling (e.g., https://your-service.run.app)
+- - `JWT_SECRET`: Secret key for signing approval link tokens (required for secure email links)
+- `IAM_TOPIC_ID`: Pub/Sub topic for IAM requests (default: iam-request-topic)
+- `APPROVALS_TOPIC_ID`: Pub/Sub topic for approval responses (default: iam-approvals-topic)
 - `PORT`: HTTP server port (default: 8080)
 - `HOST`: Server host (default: 0.0.0.0)
 
@@ -98,17 +101,30 @@ The system demonstrates **Zero-Touch IAM Provisioning** - where access requests 
 
 | Endpoint | Method | Purpose | Parameters |
 |----------|--------|---------|------------|
-| `/start_provisioning` | POST | Initiate access request | session_id, user_id, requested_role, project_scope, user_timezone |
-| `/respond` | GET | Process email approval clicks | session_id (query), action (query: APPROVED/DENIED) |
+| `/` | GET | Web UI dashboard for manual requests | None |
+| `/status` | GET | Live status dashboard (auto-refreshes every 5s) | None |
+| `/manual_trigger` | POST | Process form submission from UI | user_id, requested_role, project_scope, user_timezone (form data) |
+| `/start_provisioning` | POST | Initiate access request (API/Pub/Sub) | session_id, user_id, requested_role, project_scope, user_timezone |
+| `/process_approval_event` | POST | Process approval from Pub/Sub push | Pub/Sub envelope with session_id, approver_email, raw_response_text |
+| `/respond` | GET | Process email approval clicks | token (JWT query param) |
+| `/emergency-stop` | POST | Emergency system suspension (placeholder) | None |
 
 **Endpoint Details**:
 
 #### `/respond` (Email Callback Handler)
-- Processes approval/denial clicks from email buttons
-- Generates synthetic NLU input based on action
-- Resumes orchestrator workflow with `resume_with_approval()`
-- Returns HTML success/error page to user's browser
-- Updates `provisioning-requests` collection with decision
+- Processes approval/denial clicks from JWT-signed email links
+- Validates JWT token (checks signature, expiration, and payload)
+- Generates synthetic NLU input based on action (APPROVED/DENIED)
+- Publishes approval event to `APPROVALS_TOPIC_ID` Pub/Sub topic
+- Returns HTML acknowledgment page with redirect to `/status`
+- Updates `provisioning-requests` collection with decision status
+
+**JWT Payload Structure:**
+- `sid`: Session ID
+- `act`: Action (APPROVED/DENIED)
+- `sub`: Approver email
+- `iat`: Issued at timestamp
+- `exp`: Expiration (7 days from issuance)
 
 ### 2. IAM Orchestrator Agent (`agents/orchestrator.py`)
 
@@ -229,6 +245,15 @@ c) **Temporal Compliance Check** (`_check_temporal_compliance`) - ✅ **FULLY IM
 - ✅ Structured email templates with justification context
 - ✅ Returns message metadata (message_id, thread_id) for tracking
 
+**Security Features:**
+- ✅ JWT-signed approval links with 7-day expiration
+- ✅ Token payload includes session_id, action, and approver email
+- ✅ Links are tamper-proof and cryptographically verified
+- ✅ Fallback to unsigned links when JWT_SECRET is not configured (development only)
+
+**Link Generation:**
+- Production mode (JWT_SECRET set): `{base_url}/respond?token={signed_jwt}`
+
 **Email Template Structure**:
 - Subject: `[ACTION REQUIRED] Access request for {requester_email}`
 - Body includes:
@@ -324,7 +349,8 @@ class IAMProvisioningResponse(BaseModel):
 
 ### Firestore Collections
 
-#### 1. `adk-sessions` (Session Store)
+#### 1. `adk-sessions` (Collection in default Firestore database)
+**Note:** This is a collection within the `(default)` Firestore database, not a separate database.
 ```javascript
 {
   session_id: string,
@@ -458,8 +484,12 @@ class IAMProvisioningResponse(BaseModel):
 
 6. Human Interaction
    → Approver clicks APPROVE button in email
-   → Browser redirects to: /respond?session_id=session-123&action=APPROVED
-   → Webhook handler processes click
+   → Browser redirects to: /respond?token={signed_jwt}
+   → JWT token validated (signature, expiration, approver email)
+   → Approval event published to Pub/Sub topic: iam-approvals-topic
+   → Pub/Sub push triggers: /process_approval_event
+   → Status updated to "PROCESSING_APPROVAL" in Firestore
+   → Returns HTML acknowledgment page with redirect to /status
 
 7. NLU Classification
    Synthetic text generated from button click:
@@ -516,6 +546,18 @@ class IAMProvisioningResponse(BaseModel):
 - **Structured audit trails**: Comprehensive logging and narrative generation
 - **Docker containerization**: Ready for Cloud Run deployment
 - **Custom IAM roles**: Least-privilege security model defined
+- **Pub/Sub Integration**: ✅ **FULLY IMPLEMENTED** Async event handling via:
+  - `/start_provisioning` accepts both direct JSON and Pub/Sub push envelope
+  - `/process_approval_event` consumes approval decisions from Pub/Sub
+  - Publisher configured for `IAM_TOPIC_ID` and `APPROVALS_TOPIC_ID`
+  - Automatic base64 decoding and envelope unwrapping
+  - Error handling with retry logic (transient vs logical errors)
+- **Web UI Dashboard**: ✅ **FULLY IMPLEMENTED**
+  - Manual request submission form at `/`
+  - Live status dashboard at `/status` (auto-refresh every 5s)
+  - Real-time Firestore query for last 25 requests
+  - Color-coded status badges (success/waiting/failed/queued)
+  - Session ID display and timestamp tracking
 
 ### ⚠️ Development/Testing Features
 
@@ -523,11 +565,17 @@ class IAMProvisioningResponse(BaseModel):
   - In production, this would integrate with a real PAM (Privileged Access Management) system
   - IAM execution itself is fully functional - only the JIT "approval" step is simulated
   - The actual policy changes ARE applied to real GCP resources
+- - **Emergency Stop Mechanism**: ⚠️ **PARTIALLY IMPLEMENTED**
+  - HTTP endpoint `/emergency-stop` exists and returns suspension status
+  - **TODO:** Implement logic to:
+    - Iterate active sessions in Firestore
+    - Cancel pending approval workflows
+    - Call Provisioning Agent to revoke active JIT tokens
+    - Generate emergency audit trail
+  - Currently returns placeholder: `{"status": "SYSTEM_SUSPENDED", "action": "Revocation Queued"}`
 
 ### ❌ Not Yet Implemented
 
-- **Pub/Sub Integration**: Async event handling for inbound email responses
-- **Emergency Stop Mechanism**: Security kill switch endpoint
 - **Rate Limiting**: Request throttling and abuse detection
 - **Advanced Error Recovery**: Comprehensive retry logic for transient failures
 
@@ -552,11 +600,19 @@ class IAMProvisioningResponse(BaseModel):
    - RAG engine created
    - Policy documents indexed
 
-4. Service Accounts:
+4. Pub/Sub Topics:
+   - Create `iam-request-topic` for provisioning requests
+   - Create `iam-approvals-topic` for approval responses
+   - Configure push subscriptions:
+     - `iam-request-topic` → `{ORCHESTRATOR_URL}/start_provisioning`
+     - `iam-approvals-topic` → `{ORCHESTRATOR_URL}/process_approval_event`
+   - Set appropriate retry policies for transient failures
+
+5. Service Accounts:
    - Orchestrator SA (low privilege)
    - Provisioner SA (high privilege with custom role)
 
-5. Gmail Configuration:
+6. Gmail Configuration:
    Create service account in GCP Console
    - Download service account key → save as `orchestrator_key.json`
    - In Google Workspace Admin Console:
@@ -590,8 +646,33 @@ gcloud run deploy iam-orchestrator \
     PROJECT_ID=your-project-id,\
     A2A_PROVISIONER_URL=https://iam-provisioner-a2a-XXX.run.app,\
     RAG_ENGINE_ID=your-engine-id,\
-    RAG_DATA_STORE_ID=your-datastore-id
+    RAG_DATA_STORE_ID=your-datastore-id,\
+    JWT_SECRET=your-secure-random-secret,\
+    SENDER_EMAIL=bot@your-domain.com,\
+    APPROVAL_CALLBACK_URL=https://iam-orchestrator-XXX.run.app,\
+    IAM_TOPIC_ID=iam-request-topic,\
+    APPROVALS_TOPIC_ID=iam-approvals-topic
 ```
+#### 3. Configure Pub/Sub Push Subscriptions
+```bash
+# Subscription for IAM requests
+gcloud pubsub subscriptions create iam-requests-sub \
+  --topic=iam-request-topic \
+  --push-endpoint=https://iam-orchestrator-XXX.run.app/start_provisioning \
+  --ack-deadline=600
+
+# Subscription for approval responses
+gcloud pubsub subscriptions create iam-approvals-sub \
+  --topic=iam-approvals-topic \
+  --push-endpoint=https://iam-orchestrator-XXX.run.app/process_approval_event \
+  --ack-deadline=300
+```
+
+#### 4. Access the Web UI
+Navigate to `https://iam-orchestrator-XXX.run.app/` to:
+- Submit manual access requests via web form
+- Monitor live status at `/status` endpoint
+- View real-time request processing and status updates
 
 ---
 
@@ -604,6 +685,20 @@ gcloud run deploy iam-orchestrator \
 3. **Session Integrity**: Firestore rules enforce session ownership
 4. **Audit Immutability**: All decisions logged before execution
 5. **Temporal Guardrails**: Time-based access enforced at policy layer
+
+### JWT-Based Approval Security
+
+**Link Signing:**
+- All approval links include cryptographically signed JWT tokens
+- Tokens expire after 7 days to prevent link reuse
+- Payload binds session_id, action, and approver_email together
+- HS256 algorithm with server-side secret (`JWT_SECRET`)
+
+**Attack Prevention:**
+- ✅ Link tampering: Signature validation fails for modified tokens
+- ✅ Replay attacks: Session state prevents double-approval processing
+- ✅ Link sharing: Approver email embedded in token payload
+- ✅ Expiration: Tokens invalid after 7 days
 
 ### Threat Model
 
@@ -645,14 +740,33 @@ All requests persisted to `provisioning-requests` with:
 - Final states: `POLICY_APPLIED | REJECTED | FAILED`
 - Full result payload with timestamp
 
+### Live Status Dashboard
+
+Access real-time monitoring at `https://your-orchestrator-url/status`:
+
+**Features:**
+- Auto-refreshes every 5 seconds
+- Displays last 25 provisioning requests
+- Color-coded status badges:
+  - 🟢 Green: POLICY_APPLIED, DONE, APPROVED
+  - 🟡 Yellow: WAITING_FOR_APPROVAL
+  - 🔴 Red: FAILED, REJECTED
+  - 🔵 Blue: QUEUED, PROCESSING
+  - ⚪ Gray: UNKNOWN
+- Shows: Session ID, timestamp, user, role, scope, current status
+- Queries Firestore `provisioning-requests` collection in real-time
+
+**Dashboard URL Pattern:**
+```
+https://iam-orchestrator-XXX.run.app/status
+```
+
 ---
 
 ## Future Enhancements
 
 ### Phase 2: Production Readiness
-- Implement Communication Agent (Gmail API + Pub/Sub)
 - Integrate real PAM/JIT system
-- Add actual IAM API calls with dry-run mode
 - Implement emergency stop mechanism
 - Add rate limiting and abuse detection
 

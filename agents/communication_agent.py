@@ -63,9 +63,6 @@ class CommunicationAgent:
 
     def _generate_secure_link(self, base_url, session_id, action, approver_email):
         """Generates a signed JWT link."""
-        if not self.jwt_secret:
-            # Fallback for when secret is missing (Prototype compatibility)
-            return f"{base_url}/respond?session_id={session_id}&action={action}&approver_email={approver_email}"
         
         payload = {
             "sid": session_id,

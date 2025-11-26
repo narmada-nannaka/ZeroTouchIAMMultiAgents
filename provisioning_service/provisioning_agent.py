@@ -36,7 +36,7 @@ class IAMProvisioningResponse(BaseModel):
     """The unified schema for the Provisioning Agent's response."""
     status: str = Field(..., description="POLICY_APPLIED, EXECUTION_FAILURE, or JIT_FAILURE.")
     timestamp: str
-    reason: Optional[str] = None # <-- This now correctly references typing.Optional
+    reason: Optional[str] = None 
     applied_policy: Optional[PolicyDetails] = None
     audit_trail: Optional[AuditTrail] = None
 

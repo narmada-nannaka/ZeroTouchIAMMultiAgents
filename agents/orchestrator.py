@@ -251,7 +251,6 @@ class IAMOrchestrator(LlmAgent):
         # 4. Execution (A2A)
         req = session.state.get('request', {})
         lookup = session.state.get('lookup_result', {})
-        
         provisioning_agent = self.find_agent("iam_provisioner_client")
         logging.info("DELEGATION: NLU Approved. Calling Provisioning Agent...")
 
@@ -311,13 +310,13 @@ class IAMOrchestrator(LlmAgent):
                     "type": "function",
                     "function": {
                         "name": "execute_iam_set_tool",
-                        "arguments": json.dumps(args)  # arguments must be a JSON string
+                        "arguments": json.dumps(args)
                     }
                 }
             ]
         }
-        logging.info(f"[DEBUG] tool_call_envelope: {json.dumps(tool_call_envelope, indent=2)}")
-            
+        # Standardize on application/json part for A2A
+        # We send it as a simple text message containing the JSON.
         # Prefer an application/json part first, then a human-readable text part
         try:
             # If your google.genai types supports inline_data Blob (newer SDKs)
@@ -343,7 +342,7 @@ class IAMOrchestrator(LlmAgent):
 
         logging.info("A2A task_message parts: %s",
              [getattr(p, "mime_type", "text") for p in task_message.parts])
-            
+        
         # Delegate to the remote agent by calling it through ADK's agent delegation mechanism
         # The orchestrator's LLM will transfer control to the remote agent
         # This happens automatically through ADK's agent orchestration

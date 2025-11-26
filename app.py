@@ -27,6 +27,7 @@ RAG_DATA_STORE_ID = os.environ.get("RAG_DATA_STORE_ID")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL") 
 APPROVAL_CALLBACK_URL = os.environ.get("APPROVAL_CALLBACK_URL", "http://localhost:8080/approve")
 IAM_TOPIC_ID = os.environ.get("IAM_TOPIC_ID", "iam-request-topic")
+APPROVALS_TOPIC_ID = os.environ.get("APPROVALS_TOPIC_ID", "iam-approvals-topic")
 
 if not PROJECT_ID or not A2A_PROVISIONER_URL:
     logging.error("Missing required environment variables (PROJECT_ID or A2A_PROVISIONER_URL).")
@@ -210,8 +211,9 @@ session_service = FirestoreSessionService(
 logging.info(f"Initialized FirestoreSessionService with collection: {ADK_SESSION_DB}")
 
 publisher = pubsub_v1.PublisherClient()
-topic_path = publisher.topic_path(PROJECT_ID, IAM_TOPIC_ID)
-logging.info(f"Pub/Sub Publisher configured for: {topic_path}")
+# Define Topic Paths
+request_topic_path = publisher.topic_path(PROJECT_ID, IAM_TOPIC_ID)
+approval_topic_path = publisher.topic_path(PROJECT_ID, APPROVALS_TOPIC_ID)
 
 # Initialize the Orchestrator Agent with session service using factory method
 logging.info(f"Initializing IAMOrchestrator for Project: {PROJECT_ID}")
@@ -463,7 +465,7 @@ async def manual_trigger_handler(request: Request):
         data_str = json.dumps(payload)
         data = data_str.encode("utf-8")
         
-        future = publisher.publish(topic_path, data)
+        future = publisher.publish(request_topic_path, data)
         message_id = future.result() # Wait for publish confirmation
         
         logging.info(f"✅ Published message ID: {message_id}")
@@ -534,12 +536,133 @@ async def start_provisioning_endpoint(request: Request):
         logging.error(f"Error: {e}")
         update_provisioning_request_status(session_id, "FAILED", {"error": str(e)})
         return JSONResponse({"status": "ERROR", "error": str(e)}, status_code=500)
-    
 
+# --- PUB/SUB HANDLER FOR APPROVALS ---
+async def process_approval_event(request: Request):
+    """
+    Consumer Endpoint (Pub/Sub Push) for APPROVALS.
+    This runs the heavy NLU and IAM logic asynchronously.
+    """
+    session_id = None  # Initialize for error handling
+    approver_email = None  # Initialize for logging
+
+
+    try:
+        raw_body = await request.json()
+        
+        # Unwrap Pub/Sub Message
+        if "message" in raw_body and "data" in raw_body["message"]:
+            b64_data = raw_body["message"]["data"]
+            decoded_str = base64.b64decode(b64_data).decode("utf-8")
+            payload = json.loads(decoded_str)
+        else:
+            return JSONResponse({"error": "Not a Pub/Sub Message"}, status_code=400)
+            
+        session_id = payload.get("session_id")
+        approver_email = payload.get("approver_email")
+        raw_response_text = payload.get("raw_response_text")
+
+        # Validate required fields
+        if not all([session_id, approver_email, raw_response_text]):
+            logging.error(f"Missing required fields in payload: {payload}")
+            return JSONResponse(
+                {"status": "rejected", "reason": "Missing required fields"}, 
+                status_code=200  # ← Logical error, don't retry
+            )
+        
+        logging.info(f"⚙️ ASYNC WORKER: Processing approval for {session_id}")
+        update_provisioning_request_status(session_id, "PROCESSING_APPROVAL")
+
+        # Run the Agent Logic
+        result = await orchestrator_agent.resume_with_approval(
+            session_id=session_id,
+            raw_response_text=raw_response_text, 
+            approver_email=approver_email
+        )
+        
+        final_status = result.get('status', 'UNKNOWN')
+        update_provisioning_request_status(session_id, final_status)
+        
+        # SUCCESS - Return 200
+        return JSONResponse({
+            "status": "processed", 
+            "final_state": final_status,
+            "session_id": session_id
+        })
+
+
+    except (ValueError, KeyError, json.JSONDecodeError) as e:
+        # LOGICAL ERRORS - Don't retry these
+        logging.error(f"Logical error processing approval: {e}", exc_info=True)
+        
+        if session_id:
+            try:
+                update_provisioning_request_status(
+                    session_id, 
+                    "FAILED_LOGICAL_ERROR", 
+                    {"error": str(e), "error_type": type(e).__name__}
+                )
+            except Exception as update_error:
+                logging.error(f"Failed to update status for session {session_id}: {update_error}")
+        
+        # Return 200 to acknowledge and prevent retries
+        return JSONResponse({
+            "status": "rejected", 
+            "reason": f"Logical error: {str(e)}",
+            "error_type": type(e).__name__,
+            "session_id": session_id or "unknown"
+        }, status_code=200)
+    
+    except (ConnectionError, TimeoutError) as e:
+        # TRANSIENT ERRORS - Allow retry
+        logging.warning(f"Transient error (will retry): {e}")
+        
+        if session_id:
+            try:
+                update_provisioning_request_status(
+                    session_id, 
+                    "RETRY_PENDING", 
+                    {"error": str(e), "retry": True}
+                )
+            except Exception as update_error:
+                logging.error(f"Failed to update status for session {session_id}: {update_error}")
+        
+        
+        # Return 500 to trigger Pub/Sub retry
+        return JSONResponse({
+            "status": "retry", 
+            "reason": f"Transient error: {str(e)}",
+            "session_id": session_id or "unknown"
+        }, status_code=500)
+    
+    except Exception as e:
+        # UNKNOWN ERRORS - Log extensively and don't retry by default
+        logging.error(f"Unknown error in approval processing: {e}", exc_info=True)
+        
+        if session_id:
+            try:
+                update_provisioning_request_status(
+                    session_id, 
+                    "FAILED_UNKNOWN_ERROR", 
+                    {"error": str(e), "error_type": type(e).__name__}
+                )
+            except Exception as update_error:
+                logging.error(f"Failed to update status for session {session_id}: {update_error}")
+        
+        
+        # Return 200 by default for unknown errors
+        # This prevents infinite retry loops while you investigate
+        return JSONResponse({
+            "status": "rejected", 
+            "reason": f"Processing error: {str(e)}",
+            "note": "Message acknowledged to prevent retry loop",
+            "session_id": session_id or "unknown"
+        }, status_code=200)
+    
 async def process_approval_webhook(request: Request):
     """
-    Handles the click from the email.
-    Generates synthetic text to feed the NLU Agent.
+    Handles Email Click -> Validates JWT -> PUBLISHES to Pub/Sub.
+    Returns UI immediately.
     """
     token = request.query_params.get('token')
 
@@ -573,7 +696,7 @@ async def process_approval_webhook(request: Request):
             return HTMLResponse("<h1>Error: Invalid Link</h1>", status_code=400)
 
     logging.info(f"WEBHOOK: Received {action} for session {session_id}")
-    update_provisioning_request_status(session_id, f"HUMAN_CLICKED_{action}")
+    update_provisioning_request_status(session_id, "QUEUED_APPROVAL")
 
     # --- GENERATE SYNTHETIC TEXT FOR NLU ---
     # In a future version, this could come from a HTML text box or reply email body.
@@ -582,39 +705,35 @@ async def process_approval_webhook(request: Request):
     else:
         simulated_text = "I am REJECTING this request because it violates our internal freeze period."
 
-    # Execute the provisioning workflow
+    message_payload = {
+        "session_id": session_id,
+        "approver_email": approver_email,
+        "raw_response_text": simulated_text,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }
+    
     try:
-        # Resume the Orchestrator with TEXT, not just a flag
-        result = await orchestrator_agent.resume_with_approval(
-            session_id=session_id,
-            raw_response_text=simulated_text, 
-            approver_email=approver_email
-        )
+        data_str = json.dumps(message_payload)
+        future = publisher.publish(approval_topic_path, data_str.encode("utf-8"))
+        msg_id = future.result()
+        logging.info(f"✅ Approval queued to Pub/Sub: {msg_id}")
         
-        status = result.get('status', 'UNKOWN')
-        update_provisioning_request_status(session_id, status)
-        color = "green" if "APPLIED" in str(status) else "red"
-        audit_summary = result.get('audit_summary', 'Audit summary not available.').replace('\n', '<br>')
-        
-        html_content = f"""
+        # Return "Processing" Page
+        return HTMLResponse(f"""
         <html>
             <head>
-                <title>IAM Provisioning Decision</title>
+                <title>Processing Decision</title>
+                <meta http-equiv="refresh" content="3;url={APPROVAL_CALLBACK_URL.replace('/respond', '/status')}">
             </head>
             <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-                <h1 style="color: {color};">Decision Processed</h1>
-                <p>The NLU Agent has analyzed your input.</p>
-                <p><strong>Input:</strong> "{simulated_text}"</p>
-                <p><strong>NLU Classification:</strong> {status}</p>
-                <div style="text-align: left; background-color: #f2f2f2; padding: 20px: border-radius: 8px; margin-top: 30px; font-family: monospace; white-space: pre-wrap;">
-                    {audit_summary}
-                </div>
-                <p>You can close this window.</p>
-                <a href="{APPROVAL_CALLBACK_URL.replace('/respond', '/status')}">Back to Dashboard</a>
+                <h1 style="color: #1a73e8;">Decision Received</h1>
+                <p>Your decision has been securely queued for processing.</p>
+                <p><strong>Action:</strong> {action}</p>
+                <p><strong>Session:</strong> ...{session_id[-6:]}</p>
+                <p style="color: #666;">Redirecting to status dashboard...</p>
             </body>
         </html>
-        """
-        return HTMLResponse(html_content)
+        """)
 
     except Exception as e:
         logging.error(f"Webhook Error: {e}")
@@ -633,6 +752,7 @@ app = Starlette(
         Route('/status', status_dashboard_handler, methods=['GET']), # Status
         Route('/manual_trigger', manual_trigger_handler, methods=['POST']), # Form Handler
         Route('/start_provisioning', start_provisioning_endpoint, methods=['POST']), # Updated Trigger
+        Route('/process_approval_event', process_approval_event, methods=['POST']), 
         Route('/respond', process_approval_webhook, methods=['GET']),
         Route('/emergency-stop', emergency_stop_handler, methods=['POST']), # Safety
     ]

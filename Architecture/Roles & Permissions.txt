@@ -38,3 +38,14 @@ gcloud secrets create iam-jwt-secret --replication-policy="automatic"
 
 echo -n "SUPER_SECRET_KEY_CHANGE_THIS" | \
     gcloud secrets versions add iam-jwt-secret --data-file=-
+
+gcloud pubsub topics create iam-approvals-topic
+
+gcloud pubsub subscriptions create iam-approvals-sub \
+  --topic iam-approvals-topic \
+  --push-endpoint=[YOUR_ORCHESTRATOR_URL]/process_approval_event \
+  --push-auth-service-account=sa-pubsub-invoker@[YOUR_PROJECT_ID].iam.gserviceaccount.com
+
+gcloud pubsub topics add-iam-policy-binding iam-approvals-topic \
+  --member="serviceAccount:sa-orchestrator@[YOUR_PROJECT_ID].iam.gserviceaccount.com" \
+  --role="roles/pubsub.publisher"

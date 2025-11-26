@@ -134,7 +134,6 @@ class ServiceAccountAuthMiddleware(BaseHTTPMiddleware):
                 status_code=500
             )
 
-
 def _extract_tool_from_json_dict(d: dict):
     """
     Given a JSON dict potentially containing a tool_calls envelope, return (name, args).
@@ -211,8 +210,6 @@ def _parse_tool_from_parts(parts: list):
 # 1. Initialize the Isolated Agent
 logger.info(f"Initializing IAMProvisioningAgent")
 provisioning_agent = IAMProvisioningAgent()
-logger.info(f"Agent initialized: {provisioning_agent.name}")
-logger.info(f"Agent tools: {[tool.name for tool in provisioning_agent.tools]}")
 
 # 2. Expose the Agent as an A2A Server
 # ============================================================================
@@ -227,19 +224,7 @@ async def agent_card_handler(request: Request):
     logger.info(f"   Path: {request.url.path}")
     logger.info(f"   Full URL: {request.url}")
 
-    #Use SERVICE_URL from environment if set, otherwise construct from headers
-    if SERVICE_URL:
-        base_url = SERVICE_URL
-        logger.info(f"Using SERVICE_URL from environment: {base_url}")
-    else:
-        # Fallback: construct from request headers
-        # Get host from X-Forwarded-Host or Host header
-        host = request.headers.get('x-forwarded-host') or request.headers.get('host') or request.url.netloc
-        
-        # Cloud Run always uses HTTPS externally
-        base_url = f"https://{host}"
-        logger.info(f"Constructed base_url from headers: {base_url}")
-
+    base_url = SERVICE_URL or f"https://{request.url.netloc}"
     
     # Build the agent card following A2A protocol specification
     # Extract tool information
@@ -296,7 +281,6 @@ async def tasks_send_handler(request: Request):
    
     try:
         body = await request.json()
-        logger.info(f"[DEBUG] Raw task request body: {json.dumps(body, indent=2)}")
         
         # Extract message from A2A JSON-RPC format
         # A2A uses JSON-RPC with params containing the message
@@ -304,12 +288,8 @@ async def tasks_send_handler(request: Request):
         message = params.get("message", {})
         parts = message.get("parts", [])
         
-        # Extract tool call information from the message
-        # The LLM's tool call will be in the message parts
-        logger.info(f"[DEBUG] Message parts to parse: {json.dumps(parts, indent=2)}")
+        # Parse Tool
         tool_name, tool_input = _parse_tool_from_parts(parts)
-        logger.info(f"[DEBUG] Parsed tool_name: {tool_name}")
-        logger.info(f"[DEBUG] Parsed tool_input: {tool_input}")
 
         # Fallback: accept direct params if tool_calls not present
         if not tool_input and params:
@@ -340,7 +320,6 @@ async def tasks_send_handler(request: Request):
         # Default tool name if the envelope didn’t specify it
         tool_name = tool_name or "execute_iam_set_tool"
         
-        # Execute the tool
         for tool in provisioning_agent.tools:
             if tool.name == tool_name or tool.name == "execute_iam_set_tool":
 
