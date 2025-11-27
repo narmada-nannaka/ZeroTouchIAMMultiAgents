@@ -13,7 +13,7 @@ from starlette.responses import JSONResponse, HTMLResponse
 from starlette.requests import Request
 from agents.orchestrator import IAMOrchestrator
 from google.adk.sessions import Session, BaseSessionService
-from typing import Optional
+from typing import Dict, Any, Optional
 
 # --- 1. CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
@@ -541,7 +541,7 @@ async def start_provisioning_endpoint(request: Request):
 async def process_approval_event(request: Request):
     """
     Consumer Endpoint (Pub/Sub Push) for APPROVALS.
-    This runs the heavy NLU and IAM logic asynchronously.
+    UPDATED: Fast NLU check, then background execution.
     """
     session_id = None  # Initialize for error handling
     approver_email = None  # Initialize for logging
@@ -570,29 +570,70 @@ async def process_approval_event(request: Request):
                 status_code=200  # ← Logical error, don't retry
             )
         
-        logging.info(f"⚙️ ASYNC WORKER: Processing approval for {session_id}")
-        update_provisioning_request_status(session_id, "PROCESSING_APPROVAL")
+        logging.info(f"⚙️ FAST PATH: Processing approval for {session_id}")
+        update_provisioning_request_status(session_id, "NLU_CLASSIFICATION_STARTED")
 
-        # Run the Agent Logic
-        result = await orchestrator_agent.resume_with_approval(
+        # 🚀 STEP 1: Fast NLU Check (returns in <500ms)
+        decision_result = await orchestrator_agent.check_nlu_and_decide(
             session_id=session_id,
             raw_response_text=raw_response_text, 
             approver_email=approver_email
         )
         
-        final_status = result.get('status', 'UNKNOWN')
-        update_provisioning_request_status(session_id, final_status)
+        decision_status = decision_result.get('status')
         
-        # SUCCESS - Return 200
-        return JSONResponse({
-            "status": "processed", 
-            "final_state": final_status,
-            "session_id": session_id
-        })
+        # Handle rejection (quick path - no provisioning needed)
+        if decision_status == "REJECTED":
+            update_provisioning_request_status(session_id, f"REJECTED_{decision_result.get('reason', 'NLU')}")
+            logging.info(f"✅ [{session_id}] Fast ACK: Request rejected by NLU")
+            
+            # Return 200 immediately (ACK to Pub/Sub)
+            return JSONResponse({
+                "status": "processed_fast", 
+                "final_state": "REJECTED",
+                "reason": decision_result.get('reason'),
+                "session_id": session_id
+            })
+        
+        # Handle errors in NLU
+        if decision_status == "ERROR":
+            update_provisioning_request_status(session_id, "NLU_ERROR")
+            logging.error(f"❌ [{session_id}] NLU check failed")
+            return JSONResponse({
+                "status": "rejected",
+                "reason": decision_result.get('reason'),
+                "session_id": session_id
+            }, status_code=200)  # Still ACK to prevent retry
+        
+        # 🚀 STEP 2: If approved, queue background provisioning
+        if decision_status == "APPROVED":
+            update_provisioning_request_status(session_id, "APPROVED_PROVISIONING_QUEUED")
+            
+            nlu_result = decision_result.get('nlu_result', {})
 
+            # Fire-and-forget: Start background task
+            import asyncio
+            asyncio.create_task(
+                _background_provisioning_wrapper(
+                    orchestrator_agent,
+                    session_id,
+                    approver_email,
+                    nlu_result
+                )
+            )
+            
+            logging.info(f"✅ [{session_id}] Fast ACK: Approved, provisioning queued in background")
+            
+            # Return 200 immediately (ACK to Pub/Sub - typically <500ms from start)
+            return JSONResponse({
+                "status": "processed_fast",
+                "final_state": "APPROVED_PROVISIONING_IN_PROGRESS",
+                "session_id": session_id,
+                "message": "NLU approved, provisioning started in background"
+            })
 
     except (ValueError, KeyError, json.JSONDecodeError) as e:
-        # LOGICAL ERRORS - Don't retry these
+        # Logical errors - don't retry
         logging.error(f"Logical error processing approval: {e}", exc_info=True)
         
         if session_id:
@@ -605,7 +646,6 @@ async def process_approval_event(request: Request):
             except Exception as update_error:
                 logging.error(f"Failed to update status for session {session_id}: {update_error}")
         
-        # Return 200 to acknowledge and prevent retries
         return JSONResponse({
             "status": "rejected", 
             "reason": f"Logical error: {str(e)}",
@@ -614,7 +654,7 @@ async def process_approval_event(request: Request):
         }, status_code=200)
     
     except (ConnectionError, TimeoutError) as e:
-        # TRANSIENT ERRORS - Allow retry
+        # Transient errors - allow retry
         logging.warning(f"Transient error (will retry): {e}")
         
         if session_id:
@@ -627,8 +667,6 @@ async def process_approval_event(request: Request):
             except Exception as update_error:
                 logging.error(f"Failed to update status for session {session_id}: {update_error}")
         
-        
-        # Return 500 to trigger Pub/Sub retry
         return JSONResponse({
             "status": "retry", 
             "reason": f"Transient error: {str(e)}",
@@ -636,7 +674,7 @@ async def process_approval_event(request: Request):
         }, status_code=500)
     
     except Exception as e:
-        # UNKNOWN ERRORS - Log extensively and don't retry by default
+        # Unknown errors - log and don't retry
         logging.error(f"Unknown error in approval processing: {e}", exc_info=True)
         
         if session_id:
@@ -649,15 +687,40 @@ async def process_approval_event(request: Request):
             except Exception as update_error:
                 logging.error(f"Failed to update status for session {session_id}: {update_error}")
         
-        
-        # Return 200 by default for unknown errors
-        # This prevents infinite retry loops while you investigate
         return JSONResponse({
             "status": "rejected", 
             "reason": f"Processing error: {str(e)}",
-            "note": "Message acknowledged to prevent retry loop",
             "session_id": session_id or "unknown"
         }, status_code=200)
+
+# Helper function for background execution with proper error handling
+async def _background_provisioning_wrapper(
+    orchestrator, 
+    session_id: str, 
+    approver_email: str, 
+    nlu_result: Dict[str, Any]
+):
+    """
+    Wrapper for background provisioning that handles errors and updates Firestore.
+    """
+    try:
+        result = await orchestrator.execute_approved_provisioning(
+            session_id=session_id,
+            approver_email=approver_email,
+            nlu_result=nlu_result
+        )
+        
+        # Update final status in Firestore
+        final_status = result.get('status', 'UNKNOWN')
+        update_provisioning_request_status(session_id, final_status, result)
+        
+    except Exception as e:
+        logging.error(f"❌ Background provisioning wrapper error for {session_id}: {e}", exc_info=True)
+        update_provisioning_request_status(
+            session_id, 
+            "BACKGROUND_EXECUTION_FAILED",
+            {"error": str(e), "error_type": type(e).__name__}
+        )
     
 async def process_approval_webhook(request: Request):
     """

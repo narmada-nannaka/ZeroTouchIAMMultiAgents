@@ -6,6 +6,8 @@ import logging
 import os
 import traceback
 import jwt
+import socket
+import httplib2
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -27,7 +29,7 @@ class CommunicationAgent:
         self.approval_callback_url = approval_callback_url
         self._gmail_service = None
         self._init_error = None
-
+        self._delegated_creds = None
         self.jwt_secret = os.environ.get("JWT_SECRET")
 
         try:
@@ -49,8 +51,9 @@ class CommunicationAgent:
                 # CRITICAL: This is the Domain-Wide Delegation magic.
                 # The Service Account "becomes" the user specified in sender_email.
                 delegated_creds = creds.with_subject(sender_email)
+                self._delegated_creds = delegated_creds
                 
-                self._gmail_service = build("gmail", "v1", credentials=delegated_creds, cache_discovery=False)
+                self._gmail_service = self._build_service()
                 logging.info(f"COMM AGENT: Successfully authorized as {sender_email} via Domain-Wide Delegation.")
 
             else:
@@ -60,6 +63,11 @@ class CommunicationAgent:
             self._init_error = f"{str(exc)}\n{traceback.format_exc()}"
             logging.error(f"COMM AGENT: Failed to initialize Gmail API client: {exc}")
             self._gmail_service = None
+
+    def _build_service(self):
+        """Helper to create a fresh Gmail API client."""
+        # cache_discovery=False prevents writing a file to local disk, which aids Cloud Run startup
+        return build("gmail", "v1", credentials=self._delegated_creds, cache_discovery=False)
 
     def _generate_secure_link(self, base_url, session_id, action, approver_email):
         """Generates a signed JWT link."""
@@ -144,18 +152,6 @@ class CommunicationAgent:
                 "session_id": session_id,
             }
 
-            # --- 2. SIMULATION MODE CHECK  ---
-            if not self.sender_email or not self._gmail_service:
-                logging.warning(f"⚠️ [SIMULATION] Sending to {approver}")
-                logging.warning(f"🔗 CLICK TO APPROVE: {approve_link}")
-                
-                results.append({
-                    "approver": approver, 
-                    "status": "simulated", 
-                    "link": approve_link # Useful for debugging
-                })
-                continue # Skip actual sending
-
             # Send Real Email
             loop = asyncio.get_running_loop()
             try:
@@ -184,21 +180,56 @@ class CommunicationAgent:
         message.attach(part)
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
 
-        try:
-            result = (
-                self._gmail_service.users()
-                .messages()
-                .send(userId="me", body={"raw": raw_message})
-                .execute()
-            )
-            logging.info("COMM AGENT: Email dispatched for session %s", payload["session_id"])
-            return {
-                "message_id": result.get("id", ""),
-                "thread_id": result.get("threadId", ""),
-                "provider": "gmail",
-                "approver": payload["recipient"],
-                "status": "sent"
-            }
-        except HttpError as http_error:
-            logging.error("COMM AGENT: Gmail send failed: %s", http_error)
-            raise
+        # --- RETRY LOGIC START ---
+        max_retries = 2
+        last_error = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                # 1. Ensure service exists (or rebuild if it was set to None by previous failure)
+                if self._gmail_service is None:
+                    logging.info("COMM AGENT: Rebuilding Gmail client before sending...")
+                    self._gmail_service = self._build_service()
+
+                # 2. Attempt Send
+                result = (
+                    self._gmail_service.users()
+                    .messages()
+                    .send(userId="me", body={"raw": raw_message})
+                    .execute()
+                )
+                
+                logging.info(f"COMM AGENT: Email dispatched to {payload['recipient']} (attempt {attempt+1})")
+                return {
+                    "message_id": result.get("id", ""),
+                    "thread_id": result.get("threadId", ""),
+                    "provider": "gmail",
+                    "approver": payload["recipient"],
+                    "status": "sent"
+                }
+            except (BrokenPipeError, ConnectionResetError, socket.error, httplib2.ServerNotFoundError) as e:
+                # Network/Socket level errors imply stale connection
+                logging.warning(f"COMM AGENT: Network error on attempt {attempt+1}: {e}")
+                last_error = e
+                
+                # Force rebuild on next iteration
+                self._gmail_service = None
+                
+            except HttpError as http_error:
+                # HTTP errors (4xx, 5xx) are valid API responses, usually not fixed by retries
+                # unless it's a 503 (Service Unavailable).
+                if http_error.resp.status in [500, 502, 503, 504]:
+                     logging.warning(f"COMM AGENT: API Server error {http_error.resp.status}. Retrying...")
+                     last_error = http_error
+                     self._gmail_service = None # Rebuild just in case
+                else:
+                    # Auth error or Bad Request - fail immediately
+                    logging.error(f"COMM AGENT: Gmail API Error (Non-retriable): {http_error}")
+                    raise http_error
+
+        # If we exit the loop, we failed
+        logging.error(f"COMM AGENT: Failed to send email after {max_retries+1} attempts.")
+        if last_error:
+            raise last_error
+        else:
+             raise Exception("Unknown error during email dispatch")

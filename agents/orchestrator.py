@@ -197,33 +197,32 @@ class IAMOrchestrator(LlmAgent):
             logging.error(f"Email failed: {e}")
             return {"status": "EMAIL_FAILED", "error": str(e)}
         
-     # --- PHASE 2: EXECUTE ON APPROVAL ---
-    async def resume_with_approval(self, session_id: str, raw_response_text: str, approver_email: str) -> Dict[str, Any]:
+     # --- 2. CHECK NLU AND DECIDE ---
+    async def check_nlu_and_decide(self, session_id: str, raw_response_text: str, approver_email: str) -> Dict[str, Any]:
         """
-        Called by the Webhook when a human clicks 'Approve' or 'Deny'.
+        FAST PATH: Only runs NLU classification and returns decision.
+        Used to quickly ACK Pub/Sub messages.
+        Returns immediately after NLU, before provisioning.
         """
-        logging.info(f"[{session_id}] Resuming session. Decision: {raw_response_text}")
+        logging.info(f"[{session_id}] Fast NLU check for approval decision...")
         
         # 1. Rehydrate State
-        # Since we store session_id in Firestore, we pull the session object back.
         session = await self.session_service.get_session(
             app_name=self.name, 
-            user_id="system", # System is resuming it
+            user_id="system",
             session_id=session_id
         )
 
         if not session:
             return {"status": "ERROR", "reason": "Session not found or expired."}
-        
+    
         if session.state.get('status') != "WAITING_FOR_APPROVAL":
-             logging.warning(f"Session {session_id} is in state {session.state.get('status')}, not WAITING.")
-             # Determine if we should proceed or not. For safety, we might allow re-approvals in a prototype.
+            logging.warning(f"Session {session_id} is in state {session.state.get('status')}, not WAITING.")
 
-        # 2. CALL NLU CLASSIFIER AGENT
-        # We delegate the "understanding" of the human input to the NLU Agent.
+        # 2. CALL NLU CLASSIFIER (Fast - typically <500ms)
         nlu_agent = self.find_agent("NLUClassifierAgent")
         if not nlu_agent:
-             raise ValueError("NLUClassifierAgent not found in orchestrator.")
+            raise ValueError("NLUClassifierAgent not found in orchestrator.")
 
         nlu_tool = _get_tool_func(nlu_agent, "classify_intent")
         
@@ -233,54 +232,124 @@ class IAMOrchestrator(LlmAgent):
             sender_email=approver_email
         )
 
-        # Extract the structured decision from NLU
         decision_status = nlu_result.get("status", "REJECTED_CONTEXT_MISSING")
         decision_reason = nlu_result.get("reason_summary", "No reason provided.")
         
         logging.info(f"[{session_id}] NLU Result: {decision_status} | Reason: {decision_reason}")
 
-        # 3. Process Decision based on NLU Output
+        # Store NLU result immediately
+        session.state['nlu_classification'] = nlu_result
+        
+        # 3. Handle Rejection (Quick path)
         if decision_status != "APPROVED":
             session.state['status'] = f"REJECTED_NLU_{decision_status}"
             await self.session_service.update_session(session)
             return {
                 "status": "REJECTED", 
-                "reason": f"NLU classified response as {decision_status}. Reason: {decision_reason}"
+                "reason": f"NLU classified response as {decision_status}. Reason: {decision_reason}",
+                "should_provision": False
             }
         
-        # 4. Execution (A2A)
-        req = session.state.get('request', {})
-        lookup = session.state.get('lookup_result', {})
-        provisioning_agent = self.find_agent("iam_provisioner_client")
-        logging.info("DELEGATION: NLU Approved. Calling Provisioning Agent...")
-
-        args = {
-            "requested_role": req.get("role"),
-            "user_id": req.get("user_id"),
-            "justification": f"Approved by {approver_email}. NLU Summary: {decision_reason}",
-            "gcp_project_scope": req.get("scope")
-        }
-        
-        # Call the Robust Helper
-        execution_result = await self._run_remote_provisioning(provisioning_agent, args, session_id, req.get("user_id"))
-        
-        # 5. Audit
-        final_audit_data = {
-            "lookup": lookup,
-            "context": session.state.get('policy_context'),
-            "email": session.state.get('email_metadata'),
-            "nlu_classification": nlu_result,
-            "execution": execution_result
-        }
-        
-        audit_narrative = self._generate_audit_narrative(session_id, final_audit_data)
-        logging.info(audit_narrative)
-        
-        session.state['status'] = execution_result.get("status", "DONE")
-        session.state['final_audit'] = final_audit_data # Persist the full audit trail
+        # 4. APPROVED: Update status but DON'T execute yet
+        session.state['status'] = "APPROVED_QUEUED_FOR_EXECUTION"
         await self.session_service.update_session(session)
+        
+        return {
+            "status": "APPROVED",
+            "reason": decision_reason,
+            "should_provision": True,
+            "nlu_result": nlu_result
+        }
 
-        return {"status": execution_result.get("status"), "audit_summary": audit_narrative}
+      
+     # --- 3. EXECUTE ON APPROVAL ---
+    async def execute_approved_provisioning(self, session_id: str, approver_email: str, nlu_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        BACKGROUND TASK: Executes provisioning after NLU approval.
+        This runs asynchronously after Pub/Sub ACK is sent.
+        """
+        logging.info(f"[{session_id}] Starting background provisioning execution...")
+        
+        try:
+            # 1. Reload session
+            session = await self.session_service.get_session(
+                app_name=self.name,
+                user_id="system",
+                session_id=session_id
+            )
+            
+            if not session:
+                logging.error(f"[{session_id}] Session disappeared during background execution!")
+                return {"status": "ERROR", "reason": "Session not found"}
+        
+            req = session.state.get('request', {})
+            lookup = session.state.get('lookup_result', {})
+            
+            # 2. Update status to executing
+            session.state['status'] = "EXECUTING_PROVISIONING"
+            await self.session_service.update_session(session)
+            
+            # 3. Execute provisioning (A2A call - this is the slow part)
+            provisioning_agent = self.find_agent("iam_provisioner_client")
+            args = {
+                "requested_role": req.get("role"),
+                "user_id": req.get("user_id"),
+                "justification": f"Approved by {approver_email}. NLU Summary: {nlu_result.get('reason_summary')}",
+                "gcp_project_scope": req.get("scope")
+            }
+
+            logging.info(f"[{session_id}] Calling remote provisioning service...")
+            execution_result = await self._run_remote_provisioning(
+                provisioning_agent, args, session_id, req.get("user_id")
+            )
+            
+            # 4. Generate audit
+            final_audit_data = {
+                "lookup": lookup,
+                "context": session.state.get('policy_context'),
+                "email": session.state.get('email_metadata'),
+                "nlu_classification": nlu_result,
+                "execution": execution_result
+            }
+
+            audit_narrative = self._generate_audit_narrative(session_id, final_audit_data)
+            logging.info(audit_narrative)
+            
+            # 5. Update final state
+            final_status = execution_result.get("status", "DONE")
+            session.state['status'] = final_status
+            session.state['final_audit'] = final_audit_data
+            await self.session_service.update_session(session)
+            
+            logging.info(f"✅ [{session_id}] Background provisioning completed: {final_status}")
+            
+            return {
+                "status": final_status,
+                "audit_summary": audit_narrative
+            }
+
+        except Exception as e:
+            logging.error(f"❌ [{session_id}] Background provisioning failed: {e}", exc_info=True)
+        
+            # Update session with error
+            try:
+                session = await self.session_service.get_session(
+                    app_name=self.name, user_id="system", session_id=session_id
+                )
+                if session:
+                    session.state['status'] = "EXECUTION_ERROR"
+                    session.state['error'] = str(e)
+                    await self.session_service.update_session(session)
+            except Exception:
+                pass  # Best effort
+            
+            return {
+                "status": "EXECUTION_ERROR",
+                "error": str(e),
+                "error_type": type(e).__name__
+            }
+        
+        
 
     # --- FULL ROBUST A2A LOGIC RESTORED ---
     async def _run_remote_provisioning(self, agent, args, parent_session_id, user_id):

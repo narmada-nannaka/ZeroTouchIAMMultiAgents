@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional
 from google.cloud import resourcemanager_v3
 from google.iam.v1 import policy_pb2
 from google.type import expr_pb2
+from google.iam.v1 import options_pb2
 import logging
 import random
 import datetime
@@ -99,20 +100,30 @@ class IAMProvisioningAgent(LlmAgent):
             resource = f"projects/{project_id}"
             
             # 1. Get the current IAM policy for the project
-            current_policy = client.get_iam_policy(request={"resource": resource})
+            
+            get_policy_options = options_pb2.GetPolicyOptions(
+                requested_policy_version=3
+            )
+
+            current_policy = client.get_iam_policy(
+                request={
+                    "resource": resource,
+                    "options": get_policy_options
+                }
+            )
+
+            current_policy.version = 3
 
             if requested_role in primitive_roles:
                 # No condition allowed; version can stay as-is
-                current_policy.bindings.append(
-                    policy_pb2.Binding(
-                        role=requested_role,
-                        members=[f"user:{user_id}"],
-                    )
+                new_binding = policy_pb2.Binding(
+                    role=requested_role,
+                    members=[f"user:{user_id}"],
                 )
                 reason_text = f"Access granted (no condition allowed on primitive roles)"
                  
             else:
-                current_policy.version = 3
+                
                 # 2. Define the temporal condition for the new binding
                 expiration_time = timestamp + datetime.timedelta(hours=1) # Grant access for 1 hour
                 condition = expr_pb2.Expr(
@@ -121,14 +132,15 @@ class IAMProvisioningAgent(LlmAgent):
                     expression=f'request.time < timestamp("{expiration_time.isoformat()}")'
                 )
                 # 3. Add the new conditional binding to the policy
-                current_policy.bindings.append(
-                    policy_pb2.Binding(
-                        role=requested_role,
-                        members=[f"user:{user_id}"],
-                        condition=condition,
-                    )
+                new_binding = policy_pb2.Binding(
+                    role=requested_role,
+                    members=[f"user:{user_id}"],
+                    condition=condition,
                 )
                 reason_text = f"Access granted until {expiration_time.isoformat()}"
+
+            current_policy.bindings.append(new_binding)
+
 
             # 4. Set the updated policy
             client.set_iam_policy(
