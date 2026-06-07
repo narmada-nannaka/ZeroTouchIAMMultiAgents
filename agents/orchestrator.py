@@ -89,16 +89,16 @@ class IAMOrchestrator(LlmAgent):
         )
 
         # Remote A2A client
-        # RemoteA2aAgent will fetch the agent_card from the provisioning service URL automatically
-        agent_card_url = f"{base_url}/.well-known/agent.json"
+        # to_a2a() serves the provisioner card at /.well-known/agent-card.json
+        agent_card_url = f"{base_url}/.well-known/agent-card.json"
         logging.info(f"Initializing RemoteA2aAgent with agent card URL: {agent_card_url}")
 
-        
         remote_provisioning_agent = RemoteA2aAgent(
             name="iam_provisioner_client",
             description="Remote agent that handles secure IAM provisioning operations",
-            agent_card=agent_card_url,  # Pass URL as string - RemoteA2aAgent will fetch agent_card
+            agent_card=agent_card_url,
             httpx_client=authenticated_client,
+            use_legacy=False,
         )
 
        # 4. Instantiate the Agent (Pydantic Validation happens here)
@@ -126,7 +126,7 @@ class IAMOrchestrator(LlmAgent):
         Initial method called by the Pub/Sub trigger. Initiates the workflow.
         """
         
-        session = await self.session_service.create_session(session_id=session_id, app_name=self.name, user_id=user_id)
+        session = await self.session_service.create_session(session_id=session_id, app_name=self.name, user_id="system")
         session.state['request'] = { "user_id": user_id, "role": requested_role, "scope": project_scope, "user_timezone": user_timezone, "status": "LOOKUP_INITIATED" }
         logging.info(f"[{session_id}] Phase 1: Lookup & Context...")
         
@@ -351,182 +351,70 @@ class IAMOrchestrator(LlmAgent):
         
         
 
-    # --- FULL ROBUST A2A LOGIC RESTORED ---
     async def _run_remote_provisioning(self, agent, args, parent_session_id, user_id):
         """
-        Encapsulates the A2A execution logic with full SDK compatibility and fallback checks.
+        Delegate IAM execution to the remote provisioner via A2A.
+
+        Sends the args as a pure-JSON message; the provisioner's deterministic
+        before_model_callback parses it, executes setIamPolicy, and returns a
+        JSON IAMProvisioningResponse. (Pattern validated end-to-end in Phase 1.)
         """
-        a2a_session_id = f"{parent_session_id}_a2a_execution"
+        a2a_session_id = f"{parent_session_id}-a2a-execution"
         a2a_app_name = "IAM_A2A_Provisioner"
-        
-        # Create temp session for the remote call
+
         await self.session_service.create_session(
             session_id=a2a_session_id,
             app_name=a2a_app_name,
             user_id=user_id,
-            state={"parent_session": parent_session_id, "phase": "provisioning_execution"}
+            state={"parent_session": parent_session_id, "phase": "provisioning_execution"},
         )
 
-        logging.info(f"Created A2A session: {a2a_session_id} for remote provisioning agent")
-
-        # Create the Runner for the remote provisioning agent
         remote_runner = Runner(agent=agent, app_name=a2a_app_name, session_service=self.session_service)
 
-        # A2A-compliant envelope
-        tool_call_envelope = {
-            "tool_calls": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "execute_iam_set_tool",
-                        "arguments": json.dumps(args)
-                    }
-                }
-            ]
-        }
-        # Standardize on application/json part for A2A
-        # We send it as a simple text message containing the JSON.
-        # Prefer an application/json part first, then a human-readable text part
-        try:
-            # If your google.genai types supports inline_data Blob (newer SDKs)
-            from google.genai import types as genai_types
-            json_part = types.Part(
-                inline_data=genai_types.Blob(
-                    mime_type="application/json",
-                    data=json.dumps(tool_call_envelope).encode("utf-8"),
-                )
-            )
-        except Exception:
-            # Fallback for older SDKs that accept mime_type + data directly
-            json_part = types.Part(
-                mime_type="application/json",
-                data=tool_call_envelope  # SDK will JSON-serialize
-            )
+        # Pure-JSON message body -- the provisioner's deterministic callback expects this exact shape.
+        message = types.Content(role="user", parts=[types.Part(text=json.dumps(args))])
 
-        text_part = types.Part(text=(
-            "Execute IAM provisioning using execute_iam_set_tool; JSON args are included above."
-        ))
-
-        task_message = types.Content(role="user", parts=[json_part, text_part])
-
-        logging.info("A2A task_message parts: %s",
-             [getattr(p, "mime_type", "text") for p in task_message.parts])
-        
-        # Delegate to the remote agent by calling it through ADK's agent delegation mechanism
-        # The orchestrator's LLM will transfer control to the remote agent
-        # This happens automatically through ADK's agent orchestration
-        # We must iterate it to get the final result dictionary.
         execution_result = {}
-        result_found = False
+        final_text = None
         try:
-            logging.info(f"Starting A2A runner for session: {a2a_session_id}")
-
             async for event in remote_runner.run_async(
                 user_id=user_id,
                 session_id=a2a_session_id,
-                new_message=task_message
+                new_message=message,
             ):
-                logging.info(f"Received event type: {type(event).__name__}")
+                content = getattr(event, "content", None)
+                if content and getattr(content, "parts", None):
+                    for part in content.parts:
+                        if getattr(part, "text", None):
+                            final_text = part.text
 
-                # check if this is the final response
-                if hasattr(event, 'tool_results') and event.tool_results:
-                    logging.info(f"✓ Found {len(event.tool_results)} tool_results in event")
-                    for idx, tool_result in enumerate(event.tool_results):
-                        logging.info(f"Processing tool_result #{idx}")
-                        if hasattr(tool_result, 'output'):
-                            output = tool_result.output
-                            logging.info(f"Tool result output type: {type(output)}")
-                            # Convert Pydantic models to dict
-                            if hasattr(output, 'model_dump'):
-                                execution_result = output.model_dump()
-                            elif hasattr(output, 'dict'):
-                                execution_result = output.dict()
-                            elif isinstance(output, dict):
-                                execution_result = output
-                            elif isinstance(output, str):
-                                # Try to parse as JSON
-                                try:
-                                    execution_result = json.loads(output)
-                                except json.JSONDecodeError:
-                                    execution_result = {"raw_output": output}
-                            else:
-                                execution_result = {"raw_output": str(output)}
-
-                            logging.info(f"✓ Extracted execution_result from tool_results: {execution_result}")
-                            result_found = True
-                            break
-                    
-                # Check for final response content
-                if not result_found and hasattr(event, 'is_final_response') and event.is_final_response():
-                    logging.info("Checking final_response event")
-                    if hasattr(event, 'content') and event.content:
-                        if hasattr(event.content, 'parts') and event.content.parts:
-                            logging.info(f"Final response has {len(event.content.parts)} parts")
-                            for idx, part in enumerate(event.content.parts):
-                                logging.info(f"Processing part #{idx}, type: {type(part)}")
-                                
-                                # Check for text content
-                                if hasattr(part, 'text') and part.text:
-                                    text_content = part.text
-                                    logging.info(f"Found text content (first 200 chars): {text_content[:200]}")
-                                    
-                                    # Try to parse as JSON
-                                    try:
-                                        parsed = json.loads(text_content)
-                                        if isinstance(parsed, dict):
-                                            execution_result = parsed
-                                            logging.info(f"✓ Parsed JSON from text part: {execution_result}")
-                                            result_found = True
-                                            break
-                                    except json.JSONDecodeError as e:
-                                        logging.warning(f"Could not parse text as JSON: {e}")
-                                        # Store as raw text if it looks like a response
-                                        if "status" in text_content.lower():
-                                            execution_result = {"raw_text": text_content}
-                                            result_found = True
-                
-                # Break out of the loop if we found a result
-                if result_found:
-                    logging.info("✓ Result found, breaking out of event loop")
-                    break
-                
-            # If we didn't get any result, set a default error
-            if not execution_result:
-                logging.error("❌ No execution result received from remote agent")
-                execution_result = {
-                    "status": "NO_RESPONSE",
-                    "error": "Remote agent did not return any result"
-                }
-            else:
-                logging.info(f"✓ Final execution_result status: {execution_result.get('status', 'UNKNOWN')}")
-                # Clean up the temporary A2A session
+            if final_text:
                 try:
-                    await self.session_service.delete_session(a2a_session_id)
-                    logging.info(f"✓ Cleaned up A2A session: {a2a_session_id}")
-                except Exception as cleanup_error:
-                    logging.warning(f"Could not clean up A2A session: {cleanup_error}")
-                                
+                    execution_result = json.loads(final_text)
+                except json.JSONDecodeError:
+                    execution_result = {"status": "PARSE_ERROR", "raw": final_text}
+            else:
+                execution_result = {"status": "NO_RESPONSE", "error": "Remote agent returned no text"}
+
         except Exception as e:
-            logging.error(f"Error during A2A delegation: {e}", exc_info=True)
+            logging.error(f"A2A delegation error: {e}", exc_info=True)
             execution_result = {"status": "DELEGATION_ERROR", "error": str(e), "error_type": type(e).__name__}
         finally:
-            # --- CLEANUP BLOCK ---
             try:
                 await self.session_service.delete_session(a2a_session_id)
-                logging.info(f"✓ Cleaned up A2A session: {a2a_session_id}")
             except Exception as cleanup_error:
-                logging.warning(f"Cleanup failed: {cleanup_error}")
-            
+                logging.warning(f"A2A session cleanup failed: {cleanup_error}")
+
         return execution_result
             
     def _generate_audit_narrative(self, session_id: str, data: Dict[str, Any]) -> str:
         """Generates a human-readable summary for audit and XAI purposes."""
 
         # Safely access keys with defaults to prevent runtime errors during partial runs
-        lookup = data.get('lookup', {})
-        context = data.get('context', {})
-        nlu = data.get('nlu_classification', {})
-        execution = data.get('execution', {})
+        lookup = data.get('lookup') or {}
+        context = data.get('context') or {}
+        nlu = data.get('nlu_classification') or {}
+        execution = data.get('execution') or {}
        # Extract Execution Details (handling the Pydantic structure from provisioning_agent)
         # ProvisioningAgent returns keys: 'status', 'timestamp', 'reason', 'applied_policy', 'audit_trail'
         audit_trail = execution.get('audit_trail', {}) or {}

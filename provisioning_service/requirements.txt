@@ -1,6 +1,10 @@
 # provisioning_service/requirements.txt
-google-adk[a2a]
-google-cloud-firestore
+google-adk[a2a]==2.1.0
+a2a-sdk[http-server]        # brings sse-starlette, required by to_a2a's JSONRPCApplication server
+litellm==1.82.6           # security pin per ADK 2.0 release notes; 1.82.7/8 excluded
+google-cloud-aiplatform[adk]                # Agent Engine + Memory Bank client lives inside google-adk 2.0 itself
 google-cloud-resource-manager
+google-cloud-firestore
 uvicorn[standard]
 starlette
+python-dotenv

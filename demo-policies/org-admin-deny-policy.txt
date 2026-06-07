@@ -1,0 +1,10 @@
+﻿Policy ID: org-admin-deny-policy
+Title: Organization Administrator Access — Prohibited
+This policy explicitly prohibits direct grants of roles/owner, roles/iam.organizationAdmin, or roles/resourcemanager.organizationAdmin via the Zero Touch IAM agent.
+Constraint Type: Guardrail deny
+Status: Access denied — request must be denied automatically.
+Rationale: Organization-administrator-level access changes must be performed via the change-control board process with two-person integrity controls, not via single-approver workflows. The Zero Touch IAM agent is not authorized to grant or revoke at this scope. Such requests are forbidden and must be rejected.
+For requests that match this policy, the agent must return REJECTED with reason "Forbidden by guardrail policy: organization-admin-level grants prohibited via agent."
+Effective Date: 2025-11-01
+Owner: Compliance and Risk
+Review Cadence: Annually

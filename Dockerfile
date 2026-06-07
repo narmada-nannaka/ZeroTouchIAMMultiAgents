@@ -8,10 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 2. Copy the token specifically first (Optional, but fails fast if missing)
-COPY orchestrator_key.json .
-
-# 3. Copy the rest of the application code
+# 2. Copy the application code (.dockerignore excludes venv, secrets, etc.)
 COPY . .
 
 # Define the port Cloud Run will use

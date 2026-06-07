@@ -1,5 +1,6 @@
 # agents/nlu_classifier_agent.py
 
+import os
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
 import vertexai
@@ -40,8 +41,8 @@ class NLUClassifierAgent(LlmAgent):
     """
     # CRITICAL: Use the official, stable model identifier for the Vertex AI API
     # Using us-central1 as the default for the model endpoint.
-    DEFAULT_REGION: ClassVar[str] = "asia-southeast1"
-    DEFAULT_MODEL: ClassVar[str] = "gemini-2.5-flash"
+    DEFAULT_REGION: ClassVar[str] = os.environ.get("NLU_REGION", "us-central1")
+    DEFAULT_MODEL: ClassVar[str] = os.environ.get("NLU_MODEL", "gemini-3.1-flash-lite")
 
     def __init__(self, project_id: str, **kwargs):
 

@@ -12,8 +12,12 @@ from starlette.routing import Route
 from starlette.responses import JSONResponse, HTMLResponse
 from starlette.requests import Request
 from agents.orchestrator import IAMOrchestrator
-from google.adk.sessions import Session, BaseSessionService
+from google.adk.sessions import VertexAiSessionService, Session
+from google.adk.events import Event, EventActions
 from typing import Dict, Any, Optional
+from dotenv import load_dotenv
+
+load_dotenv()  # load .env before any os.environ.get() calls below
 
 # --- 1. CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +32,9 @@ SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 APPROVAL_CALLBACK_URL = os.environ.get("APPROVAL_CALLBACK_URL", "http://localhost:8080/approve")
 IAM_TOPIC_ID = os.environ.get("IAM_TOPIC_ID", "iam-request-topic")
 APPROVALS_TOPIC_ID = os.environ.get("APPROVALS_TOPIC_ID", "iam-approvals-topic")
+FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE", "agbg-anz-zerotouch-iam-db")
+AGENT_ENGINE_LOCATION = os.environ.get("AGENT_ENGINE_LOCATION", "us-central1")
+AGENT_ENGINE_ID = os.environ.get("AGENT_ENGINE_ID")
 
 if not PROJECT_ID or not A2A_PROVISIONER_URL:
     logging.error("Missing required environment variables (PROJECT_ID or A2A_PROVISIONER_URL).")
@@ -36,6 +43,10 @@ if not PROJECT_ID or not A2A_PROVISIONER_URL:
 if not RAG_ENGINE_ID or not RAG_DATA_STORE_ID:
     logging.error("Missing required RAG configuration (RAG_ENGINE_ID or RAG_DATA_STORE_ID).")
     raise EnvironmentError("RAG configuration environment variables are not set correctly.")
+
+if not AGENT_ENGINE_ID:
+    logging.error("Missing AGENT_ENGINE_ID — run 'python -m deployment.create_engine' and set it in .env.")
+    raise EnvironmentError("AGENT_ENGINE_ID is not set.")
 
 if not SENDER_EMAIL:
     logging.warning("SENDER_EMAIL not set. Communication Agent will run in simulation mode (no real emails sent).")
@@ -46,169 +57,69 @@ if A2A_PROVISIONER_URL.startswith("http://"):
     A2A_PROVISIONER_URL = "https://" + A2A_PROVISIONER_URL.split("://",1)[1]
 A2A_PROVISIONER_URL = A2A_PROVISIONER_URL.rstrip("/")
 
-ADK_SESSION_DB = "adk-sessions-store" #database for provisioning requests session
 PROVISIONING_REQUESTS_COLLECTION = "provisioning-requests" #dedicated collection for audit trail
 
 # Get port from environment (Cloud Run sets this)
 PORT = int(os.environ.get("PORT", 8080))
 HOST = os.environ.get("HOST", "0.0.0.0")
 
-# --- CUSTOM FIRESTORE SESSION SERVICE ---
+# --- 3. INITIALIZE FIRESTORE & AGENTS ---
 
-class FirestoreSessionService(BaseSessionService):
+# Initialize Firestore Client (named database, set via FIRESTORE_DATABASE env var)
+db = firestore.Client(project=PROJECT_ID, database=FIRESTORE_DATABASE)
+logging.info(f"Initialized Firestore client for project: {PROJECT_ID}")
+
+
+class CompatVertexAiSessionService(VertexAiSessionService):
     """
-    Custom Firestore-backed session service for ADK agents.
-    Implements persistent session storage using Firestore.
+    Adapts VertexAiSessionService to the orchestrator's ADK 1.x-style session API.
+
+    Bridges two gaps confirmed by introspection against the live engine:
+      1. update_session() doesn't exist in ADK 2.0. The orchestrator mutates
+         session.state then calls update_session(); we translate that into the
+         canonical append_event() state-delta path (direct mutation does NOT
+         persist on its own -- verified).
+      2. delete_session() is keyword-only, but the orchestrator calls it
+         positionally with just session_id (the temp A2A session). We record
+         (app_name, user_id) at create time and resolve it on delete.
     """
 
-    def __init__(self, firestore_client: firestore.Client, collection_name: str = "adk-sessions"):
-        """
-        Initialize the Firestore session service.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._coords: dict[str, tuple[str, str]] = {}
 
-        Args:
-            firestore_client: Initialized Firestore client
-            collection_name: Name of the Firestore collection to store sessions
-        """
-        self.db = firestore_client
-        self.collection_name = collection_name
-        logging.info(f"FirestoreSessionService initialized with collection: {collection_name}")
-
-    async def create_session(self, session_id: str, app_name: str, user_id: str, **kwargs) -> Session:
-        """
-        Create a new session and persist it to Firestore.
-
-        Args:
-            session_id: Unique identifier for the session
-            app_name: Name of the application/agent creating the session
-            user_id: User identifier for the session
-
-        Returns:
-            Session object
-        """
-        session = Session(
-            id=session_id,
-            app_name=app_name,
-            user_id=user_id,
-            state=kwargs.get('state', {})
+    async def create_session(self, *, app_name, user_id, state=None, session_id=None, **kwargs):
+        session = await super().create_session(
+            app_name=app_name, user_id=user_id, state=state, session_id=session_id, **kwargs
         )
-
-        # Persist to Firestore
-        doc_ref = self.db.collection(self.collection_name).document(session_id)
-        doc_ref.set({
-            "session_id": session_id,
-            "app_name": app_name,
-            "user_id": user_id,
-            "state": session.state,
-            "created_at": datetime.datetime.now(datetime.timezone.utc),
-            "updated_at": datetime.datetime.now(datetime.timezone.utc)
-        })
-
-        logging.info(f"Created and persisted session: {session_id}")
-        return session
-
-    async def get_session(self, *, app_name: str, user_id: str, session_id: str, config=None) -> Optional[Session]:
-        """
-        Retrieve a session from Firestore.
-
-        Args:
-            app_name: Application name (for ADK compatibility)
-            user_id: User ID (for ADK compatibility)
-            session_id: Unique identifier for the session
-            config: Optional GetSessionConfig for filtering events
-
-        Returns:
-            Session object if found, None otherwise
-        """
-        doc_ref = self.db.collection(self.collection_name).document(session_id)
-        doc = doc_ref.get()
-
-        if not doc.exists:
-            logging.warning(f"Session not found: {session_id}")
-            return None
-
-        data = doc.to_dict()
-        session = Session(
-            id=data["session_id"],
-            app_name=data["app_name"],
-            user_id=data["user_id"],
-            state=data.get("state", {})
-        )
-
-        logging.info(f"Retrieved session: {session_id} (app: {app_name}, user: {user_id})")
+        self._coords[session.id] = (app_name, user_id)
         return session
 
     async def update_session(self, session: Session) -> None:
-        """
-        Update an existing session in Firestore.
+        event = Event(
+            author="orchestrator",
+            invocation_id=str(uuid.uuid4()),
+            actions=EventActions(state_delta=dict(session.state)),
+        )
+        await self.append_event(session, event)
 
-        Args:
-            session: Session object to update
-        """
-        doc_ref = self.db.collection(self.collection_name).document(session.id)
-        doc_ref.update({
-            "state": session.state,
-            "updated_at": datetime.datetime.now(datetime.timezone.utc)
-        })
+    async def delete_session(self, session_id=None, *, app_name=None, user_id=None) -> None:
+        if (app_name is None or user_id is None) and session_id in self._coords:
+            app_name, user_id = self._coords[session_id]
+        if app_name is None or user_id is None:
+            logging.warning(f"delete_session: cannot resolve coords for {session_id}; skipping")
+            return
+        await super().delete_session(app_name=app_name, user_id=user_id, session_id=session_id)
+        self._coords.pop(session_id, None)
 
-        logging.info(f"Updated session: {session.id}")
 
-    async def delete_session(self, session_id: str) -> None:
-        """
-        Delete a session from Firestore.
-
-        Args:
-            session_id: Unique identifier for the session
-        """
-        doc_ref = self.db.collection(self.collection_name).document(session_id)
-        doc_ref.delete()
-
-        logging.info(f"Deleted session: {session_id}")
-
-    async def list_sessions(self, user_id: Optional[str] = None) -> list[Session]:
-        """
-        List all sessions, optionally filtered by user_id.
-
-        Args:
-            user_id: Optional user identifier to filter sessions
-
-        Returns:
-            List of Session objects
-        """
-        collection_ref = self.db.collection(self.collection_name)
-
-        # Filter by user_id if provided
-        if user_id:
-            query = collection_ref.where("user_id", "==", user_id)
-            docs = query.stream()
-        else:
-            docs = collection_ref.stream()
-
-        sessions = []
-        for doc in docs:
-            data = doc.to_dict()
-            session = Session(
-                id=data["session_id"],
-                app_name=data["app_name"],
-                user_id=data["user_id"],
-                state=data.get("state", {})
-            )
-            sessions.append(session)
-
-        logging.info(f"Listed {len(sessions)} session(s)" + (f" for user {user_id}" if user_id else ""))
-        return sessions
-
-# --- 3. INITIALIZE FIRESTORE & AGENTS ---
-
-# Initialize Firestore Client for session storage
-db = firestore.Client(project=PROJECT_ID)
-logging.info(f"Initialized Firestore client for project: {PROJECT_ID}")
-
-# Initialize custom Firestore Session Service for ADK sessions
-session_service = FirestoreSessionService(
-    firestore_client=db,
-    collection_name=ADK_SESSION_DB
+# Initialize VertexAiSessionService (backed by the bare Agent Engine)
+session_service = CompatVertexAiSessionService(
+    project=PROJECT_ID,
+    location=AGENT_ENGINE_LOCATION,
+    agent_engine_id=AGENT_ENGINE_ID,
 )
-logging.info(f"Initialized FirestoreSessionService with collection: {ADK_SESSION_DB}")
+logging.info(f"Initialized VertexAiSessionService on engine {AGENT_ENGINE_ID}")
 
 publisher = pubsub_v1.PublisherClient()
 # Define Topic Paths
@@ -808,6 +719,34 @@ async def emergency_stop_handler(request: Request):
     # In production, this would Iterate active sessions -> Cancel them -> Call Provisioner to revoke JIT tokens
     return JSONResponse({"status": "SYSTEM_SUSPENDED", "action": "Revocation Queued"})
 
+async def test_provision_handler(request: Request):
+    """TEMPORARY -- validates the A2A provisioning chain without the email/approval
+    round-trip (DWD pending). Seeds a session and calls execute_approved_provisioning
+    directly: orchestrator -> A2A -> deployed provisioner -> real setIamPolicy
+    (1-hour time-bound grant). REMOVE BEFORE DEMO."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    session_id = f"test-{uuid.uuid4()}"
+    user_id = body.get("user_id", "testengineer@narmadanannaka.com")
+    role = body.get("requested_role", "roles/storage.admin")
+    scope = body.get("project_scope", "project-data-eng-479300")
+
+    session = await orchestrator_agent.session_service.create_session(
+        session_id=session_id, app_name=orchestrator_agent.name, user_id="system"
+    )
+    session.state["request"] = {"user_id": user_id, "role": role, "scope": scope, "user_timezone": "UTC"}
+    session.state["lookup_result"] = {"role_id": role, "user_id": user_id, "gcp_project_scope": scope}
+    await orchestrator_agent.session_service.update_session(session)
+
+    result = await orchestrator_agent.execute_approved_provisioning(
+        session_id=session_id,
+        approver_email="test-approver@example.com",
+        nlu_result={"status": "APPROVED", "reason_summary": "Temp test bypass"},
+    )
+    return JSONResponse(result)
+
 # Create Starlette app with routes
 app = Starlette(
     routes=[
@@ -818,6 +757,7 @@ app = Starlette(
         Route('/process_approval_event', process_approval_event, methods=['POST']), 
         Route('/respond', process_approval_webhook, methods=['GET']),
         Route('/emergency-stop', emergency_stop_handler, methods=['POST']), # Safety
+        Route('/test_provision', test_provision_handler, methods=['POST']),  # TEMPORARY: remove before demo
     ]
 )
 

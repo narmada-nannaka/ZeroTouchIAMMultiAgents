@@ -1,14 +1,17 @@
 # Root requirements.txt for the Orchestrator Service
-google-adk[a2a]
+google-adk[a2a]==2.1.0
+litellm==1.82.6           # security pin per ADK 2.0 release notes; 1.82.7/8 excluded
 google-cloud-firestore
-google-cloud-aiplatform # Required for NLU and RAG agents
-uvicorn[standard]       # Standard server
-starlette               # Lightweight framework for ADK service wrapper
-google-auth
-google-cloud-run
+google-cloud-aiplatform==1.154.0            # PINNED (NO [adk] extra): 1.154.0 exposes vertexai.Client; the [adk] extra pins adk<2.0.0 which conflicts with google-adk 2.1.0. adk is installed explicitly above.
+google-genai==1.75.0                        # PINNED: backs vertexai.Client; matches the validated local env
 google-cloud-discoveryengine
-pytz
+google-cloud-pubsub
+google-cloud-run
+google-auth
 google-api-python-client
 google-auth-httplib2
-google-cloud-pubsub
+uvicorn[standard]
+starlette
+pytz
 pyjwt==2.9.0
+python-dotenv

@@ -1,0 +1,10 @@
+﻿Policy ID: temporal-prod-access-policy
+Title: Production Storage Access — Temporal Restriction
+This policy governs temporary elevated access (e.g., roles/storage.admin) to production GCP projects.
+Constraint Type: Temporal access only
+Permitted Window: Monday to Friday, between 08:00 and 17:00 in the user local timezone.
+Rationale: To minimize blast radius of credential compromise, production access is restricted to business hours when the security operations team can respond to anomalies in real time. Outside this window, access is automatically denied unless escalated to the on-call security engineer.
+Approval Requirements: One manager approval required, delivered via JWT-signed email link. Links expire 7 days after issuance. Access grants are time-bound to 1 hour and scoped to the requested project resource only.
+Effective Date: 2025-11-01
+Owner: Security Engineering
+Review Cadence: Quarterly

@@ -1,0 +1,10 @@
+﻿Policy ID: standard-viewer-policy
+Title: Standard Viewer Access — No Special Constraints
+This policy applies to grants of roles/viewer, roles/storage.objectViewer, and other view-only roles on non-production projects.
+Constraint Type: None (standard access)
+Permitted Window: Anytime; no temporal restrictions apply.
+Rationale: View-only access to non-production resources poses minimal risk and does not require additional guardrails beyond the standard manager-approval workflow. Approval is still required but no time-window restrictions are enforced.
+Approval Requirements: One manager approval. Access grants are time-bound to 1 hour for consistency with other roles.
+Effective Date: 2025-11-01
+Owner: Platform Engineering
+Review Cadence: Annually

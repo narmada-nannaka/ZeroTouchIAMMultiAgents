@@ -1,7 +1,11 @@
 # agents/provisioning_agent.py
 
+import os
+import json
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
+from google.adk.models import LlmResponse
+from google.genai import types
 from typing import Dict, Any, Optional
 from google.cloud import resourcemanager_v3
 from google.iam.v1 import policy_pb2
@@ -50,7 +54,7 @@ class IAMProvisioningAgent(LlmAgent):
     def __init__(self, **kwargs):
         # Define the privileged tool using a closure that captures project_id
         # The closure captures project_id directly from the parameter
-        def execute_iam_set_tool(requested_role: str, user_id: str, justification: str, gcp_project_scope: str = None, **extra_kwargs) -> IAMProvisioningResponse:
+        def execute_iam_set_tool(requested_role: str, user_id: str, justification: str, gcp_project_scope: str = None, **extra_kwargs):
             """Simulates the JIT elevation and the immutable policy application."""
             # Ignore extra parameters like 'configuration', 'context', etc.
             if extra_kwargs:
@@ -75,11 +79,61 @@ class IAMProvisioningAgent(LlmAgent):
             func=execute_iam_set_tool
         )
 
+        def deterministic_callback(callback_context, llm_request):
+            """B-strong: execute the IAM mutation deterministically and skip the LLM.
+            Fails closed -- malformed/adversarial input returns PARAMETER_ERROR and
+            never reaches the model, so the LLM can never fabricate a grant."""
+            text = ""
+            if llm_request.contents and llm_request.contents[-1].parts:
+                for part in llm_request.contents[-1].parts:
+                    if getattr(part, "text", None):
+                        text = part.text
+                        break
+            return self._deterministic_execute(text)
+
         super().__init__(
             name="IAMProvisioningAgent",
             description="Executes policy changes using ephemeral Just-in-Time credentials.",
+            model=os.environ.get("PROVISIONER_MODEL", "gemini-2.5-flash"),
             tools=[iam_tool],
+            before_model_callback=deterministic_callback,
             **kwargs
+        )
+
+    def _deterministic_execute(self, message_text: str) -> LlmResponse:
+        """Parse the A2A message body as JSON IAM args, validate, execute, and
+        return an LlmResponse. Fails closed on any parse/validation error."""
+        try:
+            args = json.loads((message_text or "").strip())
+        except Exception as e:
+            return self._error_response(f"Invalid request payload (not JSON): {e}")
+
+        if not isinstance(args, dict):
+            return self._error_response("Request payload must be a JSON object.")
+
+        required = ("requested_role", "user_id", "justification", "gcp_project_scope")
+        missing = [k for k in required if not args.get(k)]
+        if missing:
+            return self._error_response(f"Missing required fields: {missing}")
+
+        result = self._perform_iam_set(
+            args["requested_role"], args["user_id"], args["justification"], args["gcp_project_scope"]
+        )
+        return self._wrap(result.model_dump_json())
+
+    def _error_response(self, msg: str) -> LlmResponse:
+        logger.error(f"Deterministic execution rejected request: {msg}")
+        err = IAMProvisioningResponse(
+            status="PARAMETER_ERROR",
+            timestamp=datetime.datetime.now().isoformat(),
+            reason=msg,
+        )
+        return self._wrap(err.model_dump_json())
+
+    @staticmethod
+    def _wrap(payload_json: str) -> LlmResponse:
+        return LlmResponse(
+            content=types.Content(role="model", parts=[types.Part(text=payload_json)])
         )
 
     # The most sensitive tool: Executes policy change

@@ -1,9 +1,14 @@
 # agents/lookup_agent.py - REVISED (Final Correction)
 
+import os
 from google.cloud import firestore
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
 from typing import Dict, Any
+
+# Read from env var; falls back to the canonical Accenture demo DB name
+FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE", "agbg-anz-zerotouch-iam-db")
+
 
 class ApproverLookupAgent(LlmAgent):
     """
@@ -31,7 +36,7 @@ class ApproverLookupAgent(LlmAgent):
         """Queries Firestore for the approval context based on the request context."""
         
         # Initialize the Firestore client here to avoid the Pydantic error in __init__
-        firestore_db = firestore.Client(project=project_id, database="approver-store")
+        firestore_db = firestore.Client(project=project_id, database=FIRESTORE_DATABASE)
         
         # Query Firestore based on the requested role and project scope
         try:
