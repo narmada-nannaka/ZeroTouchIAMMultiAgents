@@ -115,122 +115,45 @@ class PolicyContextAgent(LlmAgent):
                 )
             )
 
-            logging.info(f"RAG Response type: {type(response)}")
-            logging.info(f"Number of results: {len(response.results)}")
-
-            if response.results:
-                first_result = response.results[0]
-                logging.info(f"First result type: {type(first_result)}")
-                logging.info(f"First result dir: {dir(first_result)}")
-                
-                if first_result.document:
-                    logging.info(f"Document fields: {first_result.document}")
-                    if first_result.document.derived_struct_data:
-                        logging.info(f"Struct data keys: {list(first_result.document.derived_struct_data.keys())}")
+            logging.info(f"RAG: {len(response.results)} result(s) for doc_type='{doc_type}'")
 
             policy_text = []
             source_links = []
 
-            # Process results - extractive_segments and extractive_answers are in derived_struct_data
             for result in response.results:
                 if not result.document:
                     continue
-                    
                 doc = result.document
-                
-                # Extract from derived_struct_data (this is where extractive content lives)
                 if hasattr(doc, 'derived_struct_data') and doc.derived_struct_data:
                     struct_data = doc.derived_struct_data
-
-                    logging.info(f"Processing struct_data type: {type(struct_data)}")
-
-                    # MapComposite objects can be accessed like dicts
-                    # Method 1: Extract extractive_segments (recommended for unstructured data)
-                    if 'extractive_segments' in struct_data:
-                        segments = struct_data['extractive_segments']
-                        logging.info(f"extractive_segments type: {type(segments)}")
-
-                        # segments is a ListValue-like object, iterate directly
-                        for segment in segments:
-                            logging.info(f"segment type: {type(segment)}")
-                            # segment is a dict-like structure
-                            if 'content' in segment:
-                                content = segment['content']
-                                if content:
-                                    policy_text.append(content)
-                                    logging.info(f"✓ Extracted segment content (first 100 chars): {content[:100]}")
-                        
-                    # Method 2: Extract extractive_answers (shorter, more precise)
-                    if 'extractive_answers' in struct_data:
-                        answers = struct_data['extractive_answers']
-                        logging.info(f"extractive_answers type: {type(answers)}")
-                        
-                        for answer in answers:
-                            logging.info(f"answer type: {type(answer)}")
-                            if 'content' in answer:
-                                content = answer['content']
-                                if content:
-                                    policy_text.append(content)
-                                    logging.info(f"✓ Extracted answer content (first 100 chars): {content[:100]}")
-                        
-                    # Fallback: Try snippets if no extractive content found
-                    # Fallback: Try snippets if no extractive content found
-                    if not policy_text and 'snippets' in struct_data:
-                        snippets = struct_data['snippets']
-                        logging.info(f"snippets type: {type(snippets)}")
-                        
-                        for snippet in snippets:
-                            logging.info(f"snippet type: {type(snippet)}")
-                            if 'snippet' in snippet:
-                                content = snippet['snippet']
-                                if content:
-                                    # Remove HTML tags from snippet
-                                    import re
-                                    content = re.sub(r'<[^>]+>', '', content)
-                                    content = content.replace('&nbsp;', ' ')
-                                    policy_text.append(content)
-                                    logging.info(f"✓ Extracted snippet (first 100 chars): {content[:100]}")
-                        
-                    # Extract source link
-                    if 'link' in struct_data:
-                        link = struct_data['link']
-                        if link:
-                            source_links.append(link)
-                            logging.info(f"✓ Extracted link: {link}")
-
-                elif isinstance(struct_data, dict):
-                    logging.info(f"DEBUG: struct_data is a dict")
-                    logging.info(f"DEBUG: dict keys: {list(struct_data.keys())}")
-
-                    # Try extracting from dict
-                    if 'extractive_segments' in struct_data:
-                        for segment in struct_data['extractive_segments']:
-                            if isinstance(segment, dict) and 'content' in segment:
-                                policy_text.append(segment['content'])
-                    
-                    if 'link' in struct_data:
+                    for segment in struct_data.get('extractive_segments', []):
+                        if segment.get('content'):
+                            policy_text.append(segment['content'])
+                    for answer in struct_data.get('extractive_answers', []):
+                        if answer.get('content'):
+                            policy_text.append(answer['content'])
+                    if not policy_text:
+                        for snippet in struct_data.get('snippets', []):
+                            content = snippet.get('snippet', '')
+                            if content:
+                                content = re.sub(r'<[^>]+>', '', content).replace('&nbsp;', ' ')
+                                policy_text.append(content)
+                    if struct_data.get('link'):
                         source_links.append(struct_data['link'])
-                else:
-                    logging.warning(f"DEBUG: Unknown struct_data type: {type(struct_data)}")
+                elif isinstance(doc.derived_struct_data if hasattr(doc, 'derived_struct_data') else {}, dict):
+                    struct_data = doc.derived_struct_data
+                    for segment in struct_data.get('extractive_segments', []):
+                        if isinstance(segment, dict) and segment.get('content'):
+                            policy_text.append(segment['content'])
+                    if struct_data.get('link'):
+                        source_links.append(struct_data['link'])
 
-            # Combine the retrieved snippets into a single context string for the LLM
             rag_context = "\n---\n".join(policy_text)
 
             if not rag_context:
-                logging.warning(f"No extractive content found for query: {search_query}")
-                logging.warning("This usually means Enterprise features are not enabled or documents are not indexed properly")
-                # Log sample structure for debugging
-                if response.results and len(response.results) > 0:
-                    sample = response.results[0]
-                    logging.info(f"Sample result structure - has document: {hasattr(sample, 'document')}")
-                    if hasattr(sample, 'document') and sample.document:
-                        logging.info(f"Document has derived_struct_data: {hasattr(sample.document, 'derived_struct_data')}")
+                logging.warning(f"RAG: no extractive content found for doc_type='{doc_type}'")
 
-            # Detect constraint type from the retrieved policy text
             constraint_type = self._detect_constraint_type(rag_context)
-
-            # Extract justification summary from policy text (first 200 chars)
-            #justification_summary = rag_context[:200] + "..." if len(rag_context) > 200 else rag_context
             justification_summary = self._build_justification_summary(response, rag_context)
 
             return {

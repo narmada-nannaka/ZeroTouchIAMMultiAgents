@@ -9,33 +9,53 @@ Run locally with ADC:
 import os
 import sys
 from dotenv import load_dotenv
-import vertexai
 
 load_dotenv()
 
 PROJECT = os.environ["PROJECT_ID"]
 LOCATION = os.environ.get("AGENT_ENGINE_LOCATION", "us-central1")
 ENGINE_ID = os.environ["AGENT_ENGINE_ID"]
-ENGINE = f"projects/{PROJECT}/locations/{LOCATION}/reasoningEngines/{ENGINE_ID}"
+ENGINE_PATH = f"projects/{PROJECT}/locations/{LOCATION}/reasoningEngines/{ENGINE_ID}"
 
 requester = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
     "DEMO_REQUESTER_EMAIL", "narmada.c.nannaka@accenture.com"
 )
 
-client = vertexai.Client(project=PROJECT, location=LOCATION)
+import google.auth
+from google.auth.transport.requests import AuthorizedSession
+
+creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+session = AuthorizedSession(creds)
+
+BASE = f"https://{LOCATION}-aiplatform.googleapis.com/v1beta1"
+
+resp = session.post(
+    f"{BASE}/{ENGINE_PATH}/memories:retrieve",
+    json={"scope": {"user_id": requester}},
+    timeout=30,
+)
+resp.raise_for_status()
+
+retrieved = resp.json().get("retrievedMemories", [])
+if not retrieved:
+    print(f"No memories found for {requester}.")
+    sys.exit(0)
 
 deleted = 0
-for item in client.agent_engines.memories.retrieve(name=ENGINE, scope={"user_id": requester}):
-    mem = getattr(item, "memory", None) or item
-    name = getattr(mem, "name", None)
-    fact = getattr(mem, "fact", "")
+for item in retrieved:
+    mem = item.get("memory", {})
+    name = mem.get("name", "")
+    fact = mem.get("fact", "")
     if not name:
         continue
-    try:
-        client.agent_engines.memories.delete(name=name)
+    del_resp = session.delete(
+        f"https://{LOCATION}-aiplatform.googleapis.com/v1beta1/{name}",
+        timeout=30,
+    )
+    if del_resp.status_code in (200, 204):
         deleted += 1
         print(f"deleted: {fact}")
-    except Exception as e:
-        print(f"failed to delete {name}: {e}")
+    else:
+        print(f"failed to delete {name}: {del_resp.status_code} {del_resp.text}")
 
 print(f"\nDeleted {deleted} memory(ies) for {requester}.")

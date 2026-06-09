@@ -6,8 +6,10 @@ PMO/
 logs/
 token.json
 agents/__pycache__/
+provisioning_service/__pycache__
 credentials.json
 orchestrator_key.json
 client_secret.json
 agbg-anz-zerotouch-senderemail-token.json
 .session_id
+__pycache__/
