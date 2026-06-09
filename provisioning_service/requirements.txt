@@ -8,3 +8,4 @@ google-cloud-firestore
 uvicorn[standard]
 starlette
 python-dotenv
+tzdata                      # zoneinfo tz database for localizing the JIT grant time (e.g. Australia/Sydney)

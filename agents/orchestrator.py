@@ -15,6 +15,11 @@ import google.auth.transport.requests
 import google.oauth2.id_token
 from typing import Dict, Any, Callable, Optional
 from google.adk.runners import Runner
+import trace_events as trace
+import memory_service as membank
+import model_armor
+import datetime
+from zoneinfo import ZoneInfo
 
 # Set up logging for visibility
 logging.basicConfig(level=logging.INFO)
@@ -129,19 +134,45 @@ class IAMOrchestrator(LlmAgent):
         session = await self.session_service.create_session(session_id=session_id, app_name=self.name, user_id="system")
         session.state['request'] = { "user_id": user_id, "role": requested_role, "scope": project_scope, "user_timezone": user_timezone, "status": "LOOKUP_INITIATED" }
         logging.info(f"[{session_id}] Phase 1: Lookup & Context...")
-        
+        trace.record_event(session_id, "Orchestrator", "running", "Coordinating request")
+
+        # --- Memory Bank: short-circuit if an active (unexpired) grant already exists ---
+        trace.record_event(session_id, "Memory Bank", "running", "Recalling prior grants")
+        _mem_count, _active_exp = membank.check_grants(user_id, requested_role, project_scope)
+        if _active_exp is not None:
+            try:
+                _exp_str = _active_exp.astimezone(ZoneInfo(user_timezone)).strftime('%H:%M %Z')
+            except Exception:
+                _exp_str = _active_exp.isoformat()
+            trace.record_event(session_id, "Memory Bank", "completed", f"Active grant found - valid until {_exp_str}")
+            _already_msg = f"You already have {requested_role} on {project_scope} from a recent request, active until {_exp_str}. No new request needed."
+            trace.record_event(session_id, "__chat__", "info", _already_msg)
+            session.state['status'] = "ALREADY_ACTIVE"
+            await self.session_service.update_session(session)
+            trace.record_event(session_id, "Orchestrator", "info", "Access already active - no new grant needed")
+            trace.done(session_id)
+            return {"status": "ALREADY_ACTIVE", "reason": _already_msg}
+        trace.record_event(session_id, "Memory Bank", "completed", f"Recalled {_mem_count} prior grant(s); none active")
+
         # --- 1. Delegate Lookup  ---
+        trace.record_event(session_id, "Lookup", "running", "Looking up approval policy")
         lookup_agent = self.find_agent("ApproverLookupAgent")
         lookup_tool_func = _get_tool_func(lookup_agent, "lookup_approvers_policy")
-        
+
         lookup_result = lookup_tool_func(user_id=user_id, role_id=requested_role, project_scope=project_scope)
         if "error" in lookup_result:
             session.state['status'] = "LOOKUP_FAILED"
-            return lookup_result 
-        
+            trace.record_event(session_id, "Lookup", "rejected", lookup_result.get("error", "Lookup failed"))
+            trace.record_event(session_id, "Orchestrator", "info", "Completed the access request flow")
+            trace.done(session_id)
+            return lookup_result
+
         session.state['lookup_result'] = lookup_result
+        _approvers = lookup_result.get("required_approvers", [])
+        trace.record_event(session_id, "Lookup", "completed", f"Approver(s): {', '.join(_approvers) if _approvers else 'none configured'}")
 
         # --- 2. Delegate RAG Retrieval & Compliance Check ---
+        trace.record_event(session_id, "Context", "running", "Retrieving policy (RAG) and checking compliance")
         context_agent = self.find_agent("PolicyContextAgent")
         doc_id = lookup_result.get("baseline_policy_doc_id", "NOT_FOUND")
         role_id = lookup_result.get("role_id", "NOT_FOUND")
@@ -161,16 +192,24 @@ class IAMOrchestrator(LlmAgent):
         if not is_compliant:
             logging.error(f"GUARDRAIL FAIL: Request rejected: {compliance_reason}")
             session.state['status'] = "POLICY_VIOLATION_REJECTED"
+            trace.record_event(session_id, "Context", "rejected", f"{constraint_type}: {compliance_reason}")
+            trace.record_event(session_id, "Orchestrator", "info", "Completed the access request flow")
+            trace.done(session_id)
             return {"status": "REJECTED", "reason": compliance_reason}
+
+        trace.record_event(session_id, "Context", "completed", f"Constraint: {constraint_type}; {compliance_reason}")
         
         # --- 3. Delegate Communication (SEND EMAIL) ---
         
         required_approvers = lookup_result.get("required_approvers", [])
         if not required_approvers:
+            trace.record_event(session_id, "Communication", "rejected", "No approvers configured")
+            trace.done(session_id)
             return {"status": "ERROR", "reason": "No approvers found configuration."}
 
         justification_text = policy_context.get("justification_summary", "No justification.")
-        
+
+        trace.record_event(session_id, "Communication", "running", f"Issuing approval request to {', '.join(required_approvers)}")
         try:
             logging.info(f"[{session_id}] Sending REAL email to {required_approvers}")
             email_result = await self.comm_agent.send_approval_email(
@@ -187,14 +226,20 @@ class IAMOrchestrator(LlmAgent):
             # UPDATE SESSION IN DB
             await self.session_service.update_session(session)
 
+            trace.record_event(session_id, "Communication", "completed", "Approval request issued")
+            trace.record_event(session_id, "Orchestrator", "info", "Awaiting approver decision")
+
             return {
-                "status": "WAITING_FOR_APPROVAL", 
+                "status": "WAITING_FOR_APPROVAL",
                 "message": f"Email sent to {required_approvers}. Workflow paused.",
                 "session_id": session_id
             }
-                
+
         except Exception as e:
             logging.error(f"Email failed: {e}")
+            trace.record_event(session_id, "Communication", "rejected", f"Email error: {e}")
+            trace.record_event(session_id, "Orchestrator", "info", "Completed the access request flow")
+            trace.done(session_id)
             return {"status": "EMAIL_FAILED", "error": str(e)}
         
      # --- 2. CHECK NLU AND DECIDE ---
@@ -219,6 +264,20 @@ class IAMOrchestrator(LlmAgent):
         if session.state.get('status') != "WAITING_FOR_APPROVAL":
             logging.warning(f"Session {session_id} is in state {session.state.get('status')}, not WAITING.")
 
+        trace.record_event(session_id, "Orchestrator", "info", "Processing approver decision")
+
+        # --- Model Armor: screen the untrusted approver reply before it reaches the LLM ---
+        trace.record_event(session_id, "Model Armor", "running", "Screening approver reply")
+        _ma_blocked, _ma_reason = model_armor.screen_prompt(raw_response_text)
+        if _ma_blocked:
+            trace.record_event(session_id, "Model Armor", "rejected", _ma_reason)
+            session.state['status'] = "REJECTED_MODEL_ARMOR"
+            await self.session_service.update_session(session)
+            trace.record_event(session_id, "Orchestrator", "info", "Completed the access request flow")
+            trace.done(session_id)
+            return {"status": "REJECTED", "reason": _ma_reason, "should_provision": False}
+        trace.record_event(session_id, "Model Armor", "completed", _ma_reason)
+
         # 2. CALL NLU CLASSIFIER (Fast - typically <500ms)
         nlu_agent = self.find_agent("NLUClassifierAgent")
         if not nlu_agent:
@@ -227,6 +286,7 @@ class IAMOrchestrator(LlmAgent):
         nlu_tool = _get_tool_func(nlu_agent, "classify_intent")
         
         logging.info(f"[{session_id}] Delegating to NLU Classifier...")
+        trace.record_event(session_id, "NLU", "running", "Classifying approver response")
         nlu_result = nlu_tool(
             email_body=raw_response_text,
             sender_email=approver_email
@@ -234,21 +294,26 @@ class IAMOrchestrator(LlmAgent):
 
         decision_status = nlu_result.get("status", "REJECTED_CONTEXT_MISSING")
         decision_reason = nlu_result.get("reason_summary", "No reason provided.")
-        
+
         logging.info(f"[{session_id}] NLU Result: {decision_status} | Reason: {decision_reason}")
 
         # Store NLU result immediately
         session.state['nlu_classification'] = nlu_result
-        
+
         # 3. Handle Rejection (Quick path)
         if decision_status != "APPROVED":
             session.state['status'] = f"REJECTED_NLU_{decision_status}"
             await self.session_service.update_session(session)
+            trace.record_event(session_id, "NLU", "rejected", f"{decision_status}: {decision_reason}")
+            trace.record_event(session_id, "Orchestrator", "info", "Completed the access request flow")
+            trace.done(session_id)
             return {
-                "status": "REJECTED", 
+                "status": "REJECTED",
                 "reason": f"NLU classified response as {decision_status}. Reason: {decision_reason}",
                 "should_provision": False
             }
+
+        trace.record_event(session_id, "NLU", "completed", f"APPROVED: {decision_reason}")
         
         # 4. APPROVED: Update status but DON'T execute yet
         session.state['status'] = "APPROVED_QUEUED_FOR_EXECUTION"
@@ -290,19 +355,30 @@ class IAMOrchestrator(LlmAgent):
             await self.session_service.update_session(session)
             
             # 3. Execute provisioning (A2A call - this is the slow part)
+            trace.record_event(session_id, "Orchestrator", "info", "Provisioning Access")
             provisioning_agent = self.find_agent("iam_provisioner_client")
             args = {
                 "requested_role": req.get("role"),
                 "user_id": req.get("user_id"),
                 "justification": f"Approved by {approver_email}. NLU Summary: {nlu_result.get('reason_summary')}",
-                "gcp_project_scope": req.get("scope")
+                "gcp_project_scope": req.get("scope"),
+                "user_timezone": req.get("user_timezone", "UTC")
             }
 
             logging.info(f"[{session_id}] Calling remote provisioning service...")
+            trace.record_event(session_id, "Provisioning", "running", "Calling secure provisioner via A2A")
             execution_result = await self._run_remote_provisioning(
                 provisioning_agent, args, session_id, req.get("user_id")
             )
-            
+
+            if execution_result.get("status") == "POLICY_APPLIED":
+                trace.record_event(session_id, "Provisioning", "completed", execution_result.get("reason", "JIT IAM policy applied"))
+                _expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+                membank.record_grant(req.get("user_id"), req.get("role"), req.get("scope"), _expiry)
+                trace.record_event(session_id, "Memory Bank", "completed", "Stored this grant for future recall")
+            else:
+                trace.record_event(session_id, "Provisioning", "rejected", execution_result.get("reason", f"Provisioning {execution_result.get('status')}"))
+
             # 4. Generate audit
             final_audit_data = {
                 "lookup": lookup,
@@ -322,7 +398,9 @@ class IAMOrchestrator(LlmAgent):
             await self.session_service.update_session(session)
             
             logging.info(f"✅ [{session_id}] Background provisioning completed: {final_status}")
-            
+            trace.record_event(session_id, "Orchestrator", "info", "Completed the access request flow")
+            trace.done(session_id)
+
             return {
                 "status": final_status,
                 "audit_summary": audit_narrative
@@ -330,7 +408,10 @@ class IAMOrchestrator(LlmAgent):
 
         except Exception as e:
             logging.error(f"❌ [{session_id}] Background provisioning failed: {e}", exc_info=True)
-        
+            trace.record_event(session_id, "Provisioning", "rejected", f"Execution error: {e}")
+            trace.record_event(session_id, "Orchestrator", "info", "Completed the access request flow")
+            trace.done(session_id)
+
             # Update session with error
             try:
                 session = await self.session_service.get_session(

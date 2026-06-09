@@ -13,8 +13,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Dict, List, Optional
 
-# Imports for Enterprise Auth
-from google.oauth2 import service_account
+# Imports for OAuth user-credential auth (sends as the consented mailbox)
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -29,35 +30,40 @@ class CommunicationAgent:
         self.approval_callback_url = approval_callback_url
         self._gmail_service = None
         self._init_error = None
-        self._delegated_creds = None
+        self._user_creds = None
         self.jwt_secret = os.environ.get("JWT_SECRET")
 
         try:
-            # --- AUTHENTICATION STRATEGY (ENTERPRISE) ---
-            
-            # 1. Look for Service Account Key (The "Master Key")
-            sa_key_path = os.environ.get("SA_KEY_PATH", "orchestrator_key.json")
-            
-            if os.path.exists(sa_key_path):
-                logging.info(f"COMM AGENT: Found Service Account Key at {sa_key_path}.")
-                logging.info(f"COMM AGENT: Attempting to impersonate user: {sender_email}")
-                
-                # Load credentials from the JSON key
-                creds = service_account.Credentials.from_service_account_file(
-                    sa_key_path, 
-                    scopes=[self.GMAIL_SCOPE]
-                )
+            # --- AUTHENTICATION STRATEGY: OAuth user credentials ---
+            # We send as a single consented mailbox (sender_email) using an OAuth
+            # refresh token -- NOT Domain-Wide Delegation. The token file bundles
+            # the refresh token + client id/secret; access tokens are minted and
+            # refreshed at runtime against Google's OAuth endpoint, so it works
+            # regardless of which project/service the agent runs in.
+            token_path = os.environ.get("GMAIL_TOKEN_PATH", "agbg-anz-zerotouch-senderemail-token.json")
 
-                # CRITICAL: This is the Domain-Wide Delegation magic.
-                # The Service Account "becomes" the user specified in sender_email.
-                delegated_creds = creds.with_subject(sender_email)
-                self._delegated_creds = delegated_creds
-                
+            if os.path.exists(token_path):
+                logging.info(f"COMM AGENT: Loading OAuth user token from {token_path}.")
+                creds = Credentials.from_authorized_user_file(token_path, scopes=[self.GMAIL_SCOPE])
+
+                if not creds.valid:
+                    if creds.expired and creds.refresh_token:
+                        logging.info("COMM AGENT: Access token expired; refreshing.")
+                        creds.refresh(Request())
+                    else:
+                        raise ValueError(
+                            "OAuth token invalid and not refreshable (missing refresh_token). "
+                            "Re-run generate_gmail_token.py."
+                        )
+
+                self._user_creds = creds
                 self._gmail_service = self._build_service()
-                logging.info(f"COMM AGENT: Successfully authorized as {sender_email} via Domain-Wide Delegation.")
+                logging.info(f"COMM AGENT: Authorized to send as {sender_email} via OAuth user credentials.")
 
             else:
-                raise FileNotFoundError(f"No credential file found. Checked '{sa_key_path}' and 'token.json'.")
+                raise FileNotFoundError(
+                    f"No OAuth token file found at '{token_path}'. Run generate_gmail_token.py to create it."
+                )
 
         except Exception as exc:
             self._init_error = f"{str(exc)}\n{traceback.format_exc()}"
@@ -67,7 +73,7 @@ class CommunicationAgent:
     def _build_service(self):
         """Helper to create a fresh Gmail API client."""
         # cache_discovery=False prevents writing a file to local disk, which aids Cloud Run startup
-        return build("gmail", "v1", credentials=self._delegated_creds, cache_discovery=False)
+        return build("gmail", "v1", credentials=self._user_creds, cache_discovery=False)
 
     def _generate_secure_link(self, base_url, session_id, action, approver_email):
         """Generates a signed JWT link."""

@@ -95,8 +95,10 @@ class PolicyContextAgent(LlmAgent):
                 )
             )
 
-            # Build proper filter syntax for document ID field
-            # Use the document id field directly instead of structData
+            # Filter to the exact policy doc via its metadata field. The JSONL
+            # import sets structData.policy_id, which surfaces in the data store
+            # schema as the indexable field "policy_id" -- filter expressions
+            # reference that schema field name, not the structData. import path.
             filter_str = f'policy_id: ANY("{doc_type}")'
 
             response = client.search(

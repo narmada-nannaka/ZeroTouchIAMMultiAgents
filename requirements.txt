@@ -10,6 +10,7 @@ google-cloud-run
 google-auth
 google-api-python-client
 google-auth-httplib2
+requests                                    # AuthorizedSession for Model Armor sanitizeUserPrompt REST call
 uvicorn[standard]
 starlette
 pytz

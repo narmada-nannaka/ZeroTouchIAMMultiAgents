@@ -8,3 +8,6 @@ token.json
 agents/__pycache__/
 credentials.json
 orchestrator_key.json
+client_secret.json
+agbg-anz-zerotouch-senderemail-token.json
+.session_id

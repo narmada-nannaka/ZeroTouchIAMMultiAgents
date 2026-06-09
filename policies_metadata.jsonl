@@ -1,0 +1,3 @@
+{"id": "temporal-prod-access-policy", "structData": {"policy_id": "temporal-prod-access-policy"}, "content": {"mimeType": "text/plain", "uri": "gs://zerotouch-iam-policies-ktzdeir-agbg-anz-gemini-vertex/policies/temporal-prod-access-policy.txt"}}
+{"id": "org-admin-deny-policy", "structData": {"policy_id": "org-admin-deny-policy"}, "content": {"mimeType": "text/plain", "uri": "gs://zerotouch-iam-policies-ktzdeir-agbg-anz-gemini-vertex/policies/org-admin-deny-policy.txt"}}
+{"id": "standard-viewer-policy", "structData": {"policy_id": "standard-viewer-policy"}, "content": {"mimeType": "text/plain", "uri": "gs://zerotouch-iam-policies-ktzdeir-agbg-anz-gemini-vertex/policies/standard-viewer-policy.txt"}}

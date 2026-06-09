@@ -14,6 +14,7 @@ from google.iam.v1 import options_pb2
 import logging
 import random
 import datetime
+from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field
 
 # Set logging to match the level used in app.py for consistency
@@ -117,7 +118,8 @@ class IAMProvisioningAgent(LlmAgent):
             return self._error_response(f"Missing required fields: {missing}")
 
         result = self._perform_iam_set(
-            args["requested_role"], args["user_id"], args["justification"], args["gcp_project_scope"]
+            args["requested_role"], args["user_id"], args["justification"],
+            args["gcp_project_scope"], args.get("user_timezone", "UTC")
         )
         return self._wrap(result.model_dump_json())
 
@@ -137,7 +139,7 @@ class IAMProvisioningAgent(LlmAgent):
         )
 
     # The most sensitive tool: Executes policy change
-    def _perform_iam_set(self, requested_role: str, user_id: str, justification: str, project_id: str) -> Dict[str, Any]:
+    def _perform_iam_set(self, requested_role: str, user_id: str, justification: str, project_id: str, user_timezone: str = "UTC") -> Dict[str, Any]:
         """
         Applies a real, conditional, time-bound IAM policy binding.
         Returns a strictly shaped dictionary to ensure Pydantic response validation passes.
@@ -191,7 +193,11 @@ class IAMProvisioningAgent(LlmAgent):
                     members=[f"user:{user_id}"],
                     condition=condition,
                 )
-                reason_text = f"Access granted until {expiration_time.isoformat()}"
+                try:
+                    _tz = ZoneInfo(user_timezone)
+                except Exception:
+                    _tz = ZoneInfo("UTC")
+                reason_text = f"Access granted for 1 hour - expires {expiration_time.astimezone(_tz).strftime('%H:%M %Z')}"
 
             current_policy.bindings.append(new_binding)
 

@@ -17,5 +17,9 @@ seed_approver_store.py
 orchestrator_key.json
 credentials.json
 token.json
+client_secret.json
+agbg-anz-zerotouch-senderemail-token.json
+generate_gmail_token.py
+memory_clear.py
 PMO/
 logs/

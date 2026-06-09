@@ -3,8 +3,8 @@
 import os
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
-import vertexai
-from vertexai.generative_models import GenerativeModel, GenerationConfig
+from google import genai
+from google.genai import types
 from typing import Dict, Any, ClassVar
 import logging
 import json
@@ -13,48 +13,22 @@ import time
 # Set up logging for visibility
 logging.basicConfig(level=logging.INFO)
 
-# Define the mandatory JSON schema for structured output
-RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "status": {
-            "type": "string",
-            "description": "The final classification of the approver's response. Must be one of the ENUM values.",
-            "enum": ["APPROVED", "DENIED", "REJECTED_CONTEXT_MISSING"],
-        },
-        "approver_id": {
-            "type": "string",
-            "description": "The email address or ID of the approver who sent the response. This must be the value provided in the sender_email input.",
-        },
-        "reason_summary": {
-            "type": "string",
-            "description": "A concise, 1-2 sentence summary of the approver's reason or comments, extracted directly from the email body.",
-        },
-    },
-    "required": ["status", "approver_id", "reason_summary"],
-}
 
 class NLUClassifierAgent(LlmAgent):
     """
-    Classifies human email responses into structured JSON using Gemini 2.5 Flash
-    via the Vertex AI SDK.
+    Classifies human approval responses into structured JSON using Gemini via
+    the google-genai SDK (the supported successor to vertexai.generative_models).
     """
-    # CRITICAL: Use the official, stable model identifier for the Vertex AI API
-    # Using us-central1 as the default for the model endpoint.
     DEFAULT_REGION: ClassVar[str] = os.environ.get("NLU_REGION", "us-central1")
-    DEFAULT_MODEL: ClassVar[str] = os.environ.get("NLU_MODEL", "gemini-3.1-flash-lite")
+    DEFAULT_MODEL: ClassVar[str] = os.environ.get("NLU_MODEL", "gemini-2.5-flash")
 
     def __init__(self, project_id: str, **kwargs):
 
-        # Define the wrapper function.
         def classify_intent(email_body: str, sender_email: str) -> Dict[str, Any]:
             """Classifies the raw email text and sender identity to return a structured JSON decision."""
             return self._perform_classification(email_body, sender_email)
 
-        # Define the tool.
-        nlu_tool = FunctionTool(
-            func=classify_intent
-        )
+        nlu_tool = FunctionTool(func=classify_intent)
 
         super().__init__(
             name="NLUClassifierAgent",
@@ -63,53 +37,52 @@ class NLUClassifierAgent(LlmAgent):
             **kwargs
         )
 
-        # Store configuration attributes and initialize the Vertex AI SDK
-        self.__dict__['project_id'] = project_id
-        # Initialize Vertex AI for the project and location
-        vertexai.init(project=project_id, location=self.DEFAULT_REGION)
-
-        # Define system instruction for the model
         system_instruction = (
             "You are an impartial, highly accurate Natural Language Understanding (NLU) service for an "
-            "automated IAM provisioning system. Your sole task is to analyze the 'Email Body' provided by the user, "
-            "classify the human approver's final intent, and return a single, valid JSON object that strictly conforms "
-            "to the provided schema. Classify as 'REJECTED_CONTEXT_MISSING' if the intent is ambiguous or if the email "
-            "contains no clear approval or denial language."
+            "automated IAM provisioning system. Analyze the 'Email Body', classify the human approver's final "
+            "intent, and return a single valid JSON object only (no prose) with exactly these keys: "
+            '"status" (one of "APPROVED", "DENIED", "REJECTED_CONTEXT_MISSING"), '
+            '"approver_id" (string), "reason_summary" (a concise 1-2 sentence summary of the approver\'s reason). '
+            "Use 'REJECTED_CONTEXT_MISSING' if the intent is ambiguous or contains no clear approval/denial language."
         )
 
-        # Initialize the GenerativeModel with system instruction
-        self.__dict__['model'] = GenerativeModel(
-            self.DEFAULT_MODEL,
-            system_instruction=system_instruction
+        # Store config + a google-genai client (Vertex backend). Assigned via
+        # __dict__ to bypass Pydantic field validation on the LlmAgent base.
+        self.__dict__['project_id'] = project_id
+        self.__dict__['_system_instruction'] = system_instruction
+        self.__dict__['_client'] = genai.Client(
+            vertexai=True, project=project_id, location=self.DEFAULT_REGION
         )
-
 
     def _perform_classification(self, email_body: str, sender_email: str) -> Dict[str, Any]:
-        """Performs the classification using the Vertex AI SDK with structured JSON output."""
+        """Performs the classification using google-genai with structured JSON output."""
         max_retries = 3
-        delay = 1 # Initial delay for exponential backoff
+        delay = 1  # Initial delay for exponential backoff
 
-        user_query = f"Email Body to Classify: \"{email_body}\""
+        user_query = f'Email Body to Classify: "{email_body}"'
 
-        # --- Structured Output Configuration ---
-        generation_config = GenerationConfig(
+        config = types.GenerateContentConfig(
+            system_instruction=self._system_instruction,
             response_mime_type="application/json",
-            response_schema=RESPONSE_SCHEMA
+            temperature=0,
+            max_output_tokens=256,
+            # Disable thinking: this is a short structured classification and the
+            # default thinking budget on 2.5 models adds seconds of latency.
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
 
-        # --- SDK Call with Exponential Backoff ---
         for attempt in range(max_retries):
             try:
-                # Use the GenerativeModel's generate_content method
-                response = self.model.generate_content(
-                    contents=[user_query],
-                    generation_config=generation_config,
+                response = self._client.models.generate_content(
+                    model=self.DEFAULT_MODEL,
+                    contents=user_query,
+                    config=config,
                 )
 
                 json_text = response.text
                 if json_text:
                     parsed_json = json.loads(json_text)
-                    # Add sender_email to the output for the Orchestrator to track
+                    # Stamp the sender so the orchestrator can track the approver.
                     parsed_json['approver_id'] = sender_email
                     logging.info(f"NLU Classification: SUCCESS -> {parsed_json.get('status')} by {sender_email}")
                     return parsed_json
@@ -117,11 +90,9 @@ class NLUClassifierAgent(LlmAgent):
                 logging.warning(f"Attempt {attempt+1}: NLU response was empty or malformed.")
 
             except Exception as e:
-                # Catching general exceptions from the SDK (e.g., timeout, 5xx, or 404/403 related to model access)
-                logging.warning(f"Attempt {attempt+1}: Vertex AI SDK Error, Retrying in {delay}s. Error: {e}")
+                logging.warning(f"Attempt {attempt+1}: genai SDK Error, Retrying in {delay}s. Error: {e}")
                 time.sleep(delay)
-                delay *= 2 # Exponential backoff
+                delay *= 2
 
-        # Fallback if all retries fail
         logging.error("NLU classification failed after all retries. Defaulting to REJECTED_CONTEXT_MISSING.")
         return {"status": "REJECTED_CONTEXT_MISSING", "approver_id": sender_email, "reason_summary": "NLU classification failed due to system error."}
