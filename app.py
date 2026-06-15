@@ -534,6 +534,34 @@ async def agent_card_handler(request: Request):
     return JSONResponse(AGENT_CARD)
 
 
+def _a2a_task_result(rpc_id: str, params: dict, state: str, text: str,
+                     task_id: str = None, context_id: str = None) -> JSONResponse:
+    """Build a spec-compliant A2A v1.0 SendMessageSuccessResponse (Task variant).
+
+    Required fields that Gemini Enterprise's Pydantic client enforces:
+      result.kind, result.contextId,
+      result.status.message.kind, result.status.message.messageId
+    """
+    return JSONResponse({
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "result": {
+            "kind": "task",
+            "id": task_id or params.get("id") or str(uuid.uuid4()),
+            "contextId": context_id or str(uuid.uuid4()),
+            "status": {
+                "state": state,
+                "message": {
+                    "kind": "message",
+                    "messageId": str(uuid.uuid4()),
+                    "role": "agent",
+                    "parts": [{"kind": "text", "text": text}],
+                },
+            },
+        },
+    })
+
+
 async def a2a_task_handler(request: Request):
     """A2A JSON-RPC task/send adapter for Gemini Enterprise Gallery invocation.
 
@@ -552,21 +580,29 @@ async def a2a_task_handler(request: Request):
 
     rpc_id = body.get("id")
     method = body.get("method", "")
+    logging.info(f"A2A inbound method={method!r} body_keys={list(body.keys())}")
+
     if method not in ("tasks/send", "message/send"):
         return JSONResponse({
             "jsonrpc": "2.0", "id": rpc_id,
             "error": {"code": -32601, "message": f"Method '{method}' not supported"}
         }, status_code=400)
 
-    # Extract the user text from the A2A message parts
+    # Extract the user text from the A2A message parts.
+    # A2A spec ≤0.x used "type"; spec 1.0 (Gemini Enterprise) uses "kind".
+    # Accept both so the handler works regardless of which version calls us.
     params = body.get("params", {})
     message = params.get("message", {})
     parts = message.get("parts", [])
     user_text = " ".join(
-        p.get("text", "") for p in parts if p.get("type") == "text"
+        p.get("text", "")
+        for p in parts
+        if p.get("type") == "text" or p.get("kind") == "text"
     ).strip()
+    logging.info(f"A2A extracted text ({len(parts)} parts): {user_text[:120]!r}")
 
     if not user_text:
+        logging.warning(f"A2A: no text found in parts — raw parts: {parts}")
         return JSONResponse({
             "jsonrpc": "2.0", "id": rpc_id,
             "error": {"code": -32602, "message": "No text content in message parts"}
@@ -575,29 +611,14 @@ async def a2a_task_handler(request: Request):
     # Model Armor: screen before parsing
     blocked, ma_reason = model_armor.screen_prompt(user_text)
     if blocked:
-        return JSONResponse({
-            "jsonrpc": "2.0", "id": rpc_id,
-            "result": {
-                "id": params.get("id", rpc_id),
-                "status": {"state": "failed", "message": {"role": "agent", "parts": [
-                    {"type": "text", "text": f"Request blocked by Model Armor: {ma_reason}. Please rephrase."}
-                ]}},
-            }
-        })
+        return _a2a_task_result(rpc_id, params, "failed",
+                                f"Request blocked by Model Armor: {ma_reason}. Please rephrase.")
 
     # Parse the request (no history on single-turn A2A invocation)
     parsed = parse_request(user_text)
     if not parsed.get("matched"):
         clarification = parsed.get("message", "I can only help with IAM access requests. Please specify the role and project.")
-        return JSONResponse({
-            "jsonrpc": "2.0", "id": rpc_id,
-            "result": {
-                "id": params.get("id", rpc_id),
-                "status": {"state": "input-required", "message": {"role": "agent", "parts": [
-                    {"type": "text", "text": clarification}
-                ]}},
-            }
-        })
+        return _a2a_task_result(rpc_id, params, "input-required", clarification)
 
     # Auto-submit (no confirmation card on A2A path)
     session_id = f"session-{uuid.uuid4()}"
@@ -629,20 +650,12 @@ async def a2a_task_handler(request: Request):
         f"**Role:** {parsed['requested_role']}\n"
         f"**Project:** {parsed['project_scope']}\n"
         f"**Requester:** {parsed['user_id']}\n"
-        f"**Session:** {session_id[-12:]}\n\n"
-        f"The designated approver has been notified. Access will be granted as a "
-        f"time-bound 1-hour JIT binding once approved. You can track progress at: "
-        f"{_ORCHESTRATOR_URL}"
+        f"**Session ID:** {session_id[-12:]}\n\n"
+        f"The designated approver has been notified by email. "
+        f"Access will be granted as a time-bound 1-hour JIT binding once approved."
     )
-    return JSONResponse({
-        "jsonrpc": "2.0", "id": rpc_id,
-        "result": {
-            "id": params.get("id", rpc_id),
-            "status": {"state": "completed", "message": {"role": "agent", "parts": [
-                {"type": "text", "text": reply}
-            ]}},
-        }
-    })
+    return _a2a_task_result(rpc_id, params, "completed", reply,
+                            task_id=session_id, context_id=session_id)
 
 # --- CONVERSATIONAL INTAKE (chunk A) ---
 
